@@ -237,6 +237,7 @@ def update_state_with_current_position(api: kf.KrakenFuturesApi):
     
     if state["starting_capital"] is None:
         state["starting_capital"] = portfolio_value
+        log.info(f"Initialized starting capital: ${portfolio_value:.2f}")
     
     # Calculate performance if we have starting capital
     if state["starting_capital"]:
@@ -248,8 +249,23 @@ def update_state_with_current_position(api: kf.KrakenFuturesApi):
             "total_trades": len(state.get("trades", [])),
         }
     
+    # Ensure strategy_info exists
+    if "strategy_info" not in state:
+        state["strategy_info"] = {
+            "sma_period": SMA_PERIOD,
+            "atr_period": ATR_PERIOD,
+            "atr_multiplier": ATR_MULTIPLIER,
+            "leverage": LEV,
+            "last_updated": datetime.now(timezone.utc).isoformat()
+        }
+    
     save_state(state)
     log.info(f"Updated state with current position and portfolio value: ${portfolio_value:.2f}")
+    
+    if current_pos:
+        log.info(f"Current position: {current_pos['signal']} {current_pos['size_btc']:.4f} BTC @ ${current_pos['fill_price']:.2f}")
+    else:
+        log.info("No current position")
 
 
 def daily_trade(api: kf.KrakenFuturesApi):
@@ -356,23 +372,17 @@ def main():
 
     api = kf.KrakenFuturesApi(api_key, api_sec)
     
-    # Initialize strategy info in state
-    state = load_state()
-    state["strategy_info"] = {
-        "sma_period": SMA_PERIOD,
-        "atr_period": ATR_PERIOD,
-        "atr_multiplier": ATR_MULTIPLIER,
-        "leverage": LEV,
-        "last_updated": datetime.now(timezone.utc).isoformat()
-    }
-    save_state(state)
+    log.info("Initializing strategy and state...")
     
-    # Run smoke test
-    log.info("Running smoke test...")
-    smoke_test(api)
+    # Run smoke test first
+    if not smoke_test(api):
+        log.error("Smoke test failed, exiting")
+        sys.exit(1)
     
-    # Update state with current position
+    # Update state with current position - this creates the state file
     update_state_with_current_position(api)
+    
+    log.info("State file initialized with current portfolio data")
 
     if RUN_TRADE_NOW:
         log.info("RUN_TRADE_NOW=true – executing trade now")
