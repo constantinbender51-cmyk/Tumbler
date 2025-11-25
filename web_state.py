@@ -372,18 +372,18 @@ def dashboard():
     if current_value_raw == 0 and state.get("trades"):
         current_value_raw = state["trades"][-1].get("portfolio_value", 0)
     
-    current_value = f"{current_value_raw:.2f}"
+    current_value = f"{current_value_raw:.2f}" if current_value_raw else "0.00"
     
-    starting_capital_raw = performance.get('starting_capital', state.get('starting_capital', 0))
-    starting_capital = f"{starting_capital_raw:.2f}"
+    starting_capital_raw = performance.get('starting_capital') or state.get('starting_capital') or 0
+    starting_capital = f"{starting_capital_raw:.2f}" if starting_capital_raw else "0.00"
     
     total_return_raw = performance.get('total_return_pct', 0)
     
     # Calculate return if we have values but no calculated return
-    if total_return_raw == 0 and starting_capital_raw > 0 and current_value_raw > 0:
+    if total_return_raw == 0 and starting_capital_raw and current_value_raw:
         total_return_raw = (current_value_raw - starting_capital_raw) / starting_capital_raw * 100
     
-    total_return = f"{total_return_raw:.2f}"
+    total_return = f"{total_return_raw:.2f}" if total_return_raw else "0.00"
     total_trades = performance.get('total_trades', len(state.get("trades", [])))
     
     # Strategy info
@@ -402,9 +402,9 @@ def dashboard():
             trade_copy['timestamp'] = dt.strftime('%Y-%m-%d %H:%M:%S')
         except:
             pass
-        trade_copy['size_btc'] = f"{trade['size_btc']:.4f}"
-        trade_copy['fill_price'] = f"{trade['fill_price']:.2f}"
-        trade_copy['portfolio_value'] = f"{trade['portfolio_value']:.2f}"
+        trade_copy['size_btc'] = f"{trade.get('size_btc', 0):.4f}"
+        trade_copy['fill_price'] = f"{trade.get('fill_price', 0):.2f}"
+        trade_copy['portfolio_value'] = f"{trade.get('portfolio_value', 0):.2f}"
         trade_copy['sma_365'] = f"{trade.get('sma_365', 0):.2f}"
         trade_copy['atr'] = f"{trade.get('atr', 0):.2f}"
         trade_copy['stop_distance'] = f"{trade.get('stop_distance', 0):.2f}"
