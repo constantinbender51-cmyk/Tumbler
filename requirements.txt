@@ -1,0 +1,9 @@
+Flask
+pandas
+numpy
+scikit-learn
+requests
+gunicorn
+setuptools
+tensorflow
+python-dotenv
