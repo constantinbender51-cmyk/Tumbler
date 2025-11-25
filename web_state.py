@@ -360,11 +360,24 @@ def dashboard():
     # Performance metrics - use live portfolio value if available
     performance = state.get("performance", {})
     current_value_raw = state.get("current_portfolio_value", performance.get('current_value', 0))
+    
+    # If still zero, try to get from last trade
+    if current_value_raw == 0 and state.get("trades"):
+        current_value_raw = state["trades"][-1].get("portfolio_value", 0)
+    
     current_value = f"{current_value_raw:.2f}"
-    starting_capital = f"{performance.get('starting_capital', 0):.2f}"
+    
+    starting_capital_raw = performance.get('starting_capital', state.get('starting_capital', 0))
+    starting_capital = f"{starting_capital_raw:.2f}"
+    
     total_return_raw = performance.get('total_return_pct', 0)
+    
+    # Calculate return if we have values but no calculated return
+    if total_return_raw == 0 and starting_capital_raw > 0 and current_value_raw > 0:
+        total_return_raw = (current_value_raw - starting_capital_raw) / starting_capital_raw * 100
+    
     total_return = f"{total_return_raw:.2f}"
-    total_trades = performance.get('total_trades', 0)
+    total_trades = performance.get('total_trades', len(state.get("trades", [])))
     
     # Strategy info
     strategy_info = state.get("strategy_info", {})
