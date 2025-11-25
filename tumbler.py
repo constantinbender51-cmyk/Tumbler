@@ -383,6 +383,12 @@ def main():
     update_state_with_current_position(api)
     
     log.info("State file initialized with current portfolio data")
+    
+    # Ensure state file exists and is written
+    if STATE_FILE.exists():
+        log.info(f"State file confirmed at: {STATE_FILE.absolute()}")
+    else:
+        log.error("State file was not created!")
 
     if RUN_TRADE_NOW:
         log.info("RUN_TRADE_NOW=true – executing trade now")
@@ -392,6 +398,7 @@ def main():
             log.exception("Immediate trade failed: %s", exc)
 
     log.info("Starting web dashboard on port %s", os.getenv("PORT", 8080))
+    time.sleep(1)  # Give state file time to be fully written
     subprocess.Popen([sys.executable, "web_state.py"])
 
     while True:
