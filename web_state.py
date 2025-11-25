@@ -339,6 +339,13 @@ def load_state():
 def dashboard():
     state = load_state()
     
+    # Debug logging
+    app.logger.info(f"State loaded: {len(state)} keys")
+    app.logger.info(f"Current portfolio value: {state.get('current_portfolio_value')}")
+    app.logger.info(f"Starting capital: {state.get('starting_capital')}")
+    app.logger.info(f"Performance: {state.get('performance')}")
+    app.logger.info(f"Number of trades: {len(state.get('trades', []))}")
+    
     # Current position - prioritize live position from Kraken
     current_position = state.get("current_position")
     current_signal = "N/A"
