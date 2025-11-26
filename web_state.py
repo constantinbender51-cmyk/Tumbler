@@ -563,3 +563,39 @@ def dashboard():
     
     return render_template_string(
         HTML_TEMPLATE,
+        current_signal=current_signal,
+        current_size=current_size,
+        current_price=current_price,
+        current_value=current_value,
+        starting_capital=starting_capital,
+        total_return=total_return,
+        total_return_raw=total_return_raw,
+        total_trades=total_trades,
+        today_prediction=today_prediction,
+        train_mse=train_mse,
+        lookback=lookback,
+        leverage=leverage,
+        last_trained=last_trained,
+        predictions=predictions,
+        trades=trades,
+        last_updated=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+    )
+
+
+@app.route('/debug')
+def debug():
+    """Debug endpoint to check state file and live data"""
+    debug_info = {
+        "state_file_path": str(STATE_FILE.absolute()),
+        "state_file_exists": STATE_FILE.exists(),
+        "state_file_size": STATE_FILE.stat().st_size if STATE_FILE.exists() else 0,
+        "kraken_api_configured": bool(KRAKEN_API_KEY and KRAKEN_API_SECRET and kf),
+        "state_content": load_state(),
+        "live_kraken_data": get_live_kraken_data()
+    }
+    return f"<pre>{json.dumps(debug_info, indent=2)}</pre>"
+
+
+if __name__ == '__main__':
+    port = int(os.getenv('PORT', 8080))
+    app.run(host='0.0.0.0', port=port, debug=False)
