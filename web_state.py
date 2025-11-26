@@ -42,195 +42,231 @@ HTML_TEMPLATE = """
             box-sizing: border-box;
         }
         body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: #333;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+            background: #ffffff;
+            color: #000000;
             padding: 20px;
             min-height: 100vh;
         }
         .container {
             max-width: 1400px;
             margin: 0 auto;
-            background: white;
-            border-radius: 15px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
-            padding: 30px;
+            background: #ffffff;
+            border: 1px solid #e0e0e0;
+            padding: 40px;
         }
         h1 {
-            color: #764ba2;
-            margin-bottom: 10px;
-            font-size: 2.5em;
+            color: #000000;
+            margin-bottom: 8px;
+            font-size: 2em;
             text-align: center;
+            font-weight: 600;
+            letter-spacing: -0.5px;
         }
         .subtitle {
             text-align: center;
-            color: #666;
-            margin-bottom: 30px;
-            font-size: 1.1em;
+            color: #666666;
+            margin-bottom: 40px;
+            font-size: 0.95em;
+            font-weight: 400;
         }
         .grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 20px;
-            margin-bottom: 30px;
+            gap: 1px;
+            margin-bottom: 40px;
+            border: 1px solid #000000;
         }
         .card {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 25px;
-            border-radius: 10px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            background: #ffffff;
+            color: #000000;
+            padding: 30px;
+            border-right: 1px solid #000000;
+            border-bottom: 1px solid #000000;
+        }
+        .card:last-child {
+            border-right: none;
         }
         .card h2 {
-            font-size: 1.2em;
-            margin-bottom: 15px;
-            opacity: 0.9;
+            font-size: 0.75em;
+            margin-bottom: 12px;
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #666666;
         }
         .card-value {
-            font-size: 2em;
-            font-weight: bold;
-            margin-bottom: 5px;
+            font-size: 2.2em;
+            font-weight: 300;
+            margin-bottom: 8px;
+            letter-spacing: -1px;
         }
         .card-label {
-            font-size: 0.9em;
-            opacity: 0.8;
+            font-size: 0.85em;
+            color: #666666;
+            font-weight: 400;
         }
         .section {
-            background: #f8f9fa;
-            padding: 25px;
-            border-radius: 10px;
-            margin-bottom: 20px;
+            background: #ffffff;
+            padding: 0;
+            margin-bottom: 40px;
+            border-top: 2px solid #000000;
         }
         .section h2 {
-            color: #764ba2;
-            margin-bottom: 15px;
-            font-size: 1.5em;
-            border-bottom: 2px solid #667eea;
-            padding-bottom: 10px;
+            color: #000000;
+            margin-bottom: 25px;
+            margin-top: 25px;
+            font-size: 1em;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
         }
         table {
             width: 100%;
             border-collapse: collapse;
-            background: white;
-            border-radius: 8px;
-            overflow: hidden;
+            background: #ffffff;
+            border: 1px solid #000000;
         }
         th {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 12px;
+            background: #000000;
+            color: #ffffff;
+            padding: 14px 12px;
             text-align: left;
-            font-weight: 600;
+            font-weight: 500;
+            font-size: 0.75em;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
         }
         td {
-            padding: 12px;
+            padding: 14px 12px;
             border-bottom: 1px solid #e0e0e0;
+            font-size: 0.9em;
+        }
+        tr:last-child td {
+            border-bottom: none;
         }
         tr:hover {
-            background: #f5f5f5;
+            background: #f9f9f9;
         }
         .long {
-            color: #10b981;
-            font-weight: bold;
+            color: #000000;
+            font-weight: 600;
         }
         .short {
-            color: #ef4444;
-            font-weight: bold;
+            color: #666666;
+            font-weight: 600;
         }
         .positive {
-            color: #10b981;
+            color: #000000;
+            font-weight: 600;
         }
         .negative {
-            color: #ef4444;
+            color: #666666;
+            font-weight: 600;
         }
         .model-info {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 15px;
+            gap: 1px;
+            border: 1px solid #000000;
         }
         .model-stat {
-            background: white;
-            padding: 15px;
-            border-radius: 8px;
-            border-left: 4px solid #667eea;
+            background: #ffffff;
+            padding: 20px;
+            border-right: 1px solid #000000;
+            border-bottom: 1px solid #000000;
+        }
+        .model-stat:last-child {
+            border-right: none;
         }
         .model-stat-label {
-            font-size: 0.9em;
-            color: #666;
-            margin-bottom: 5px;
+            font-size: 0.75em;
+            color: #666666;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            font-weight: 500;
         }
         .model-stat-value {
-            font-size: 1.3em;
-            font-weight: bold;
-            color: #333;
+            font-size: 1.4em;
+            font-weight: 300;
+            color: #000000;
         }
         .timestamp {
             text-align: center;
-            color: #666;
-            margin-top: 20px;
-            font-size: 0.9em;
+            color: #999999;
+            margin-top: 40px;
+            font-size: 0.8em;
+            font-weight: 400;
         }
         .no-data {
             text-align: center;
-            padding: 40px;
-            color: #666;
-            font-style: italic;
+            padding: 60px 20px;
+            color: #999999;
+            font-style: normal;
+            font-size: 0.9em;
         }
         .prediction-row {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            padding: 10px;
+            padding: 14px 12px;
             background: white;
-            margin-bottom: 10px;
-            border-radius: 6px;
-            border-left: 4px solid #667eea;
+            margin-bottom: 1px;
+            border: 1px solid #e0e0e0;
         }
         .prediction-date {
-            font-weight: bold;
-            color: #333;
+            font-weight: 600;
+            color: #000000;
+            font-size: 0.9em;
         }
         .prediction-values {
             display: flex;
-            gap: 20px;
+            gap: 30px;
         }
         .prediction-item {
             text-align: center;
         }
         .prediction-item-label {
-            font-size: 0.8em;
-            color: #666;
+            font-size: 0.75em;
+            color: #666666;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 4px;
         }
         .prediction-item-value {
-            font-size: 1.1em;
-            font-weight: bold;
+            font-size: 1em;
+            font-weight: 600;
+            color: #000000;
         }
         .badge {
             display: inline-block;
-            padding: 4px 12px;
-            border-radius: 12px;
-            font-size: 0.9em;
-            font-weight: bold;
+            padding: 4px 10px;
+            font-size: 0.75em;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            border: 1px solid #000000;
         }
         .badge-long {
-            background: #10b981;
-            color: white;
+            background: #000000;
+            color: #ffffff;
         }
         .badge-short {
-            background: #ef4444;
-            color: white;
+            background: #ffffff;
+            color: #000000;
         }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🤖 Tumbler Trading Dashboard</h1>
-        <div class="subtitle">Real-time monitoring of LSTM-powered trading strategy</div>
+        <h1>Tumbler Trading Dashboard</h1>
+        <div class="subtitle">LSTM Neural Network Strategy with 20-Day Lookback and On-Chain Metrics</div>
         
         {% if total_trades == 0 %}
-        <div style="background: #fff3cd; color: #856404; padding: 15px; border-radius: 8px; margin-bottom: 20px; text-align: center;">
-            ⏳ <strong>Waiting for first trade execution at 00:01 UTC</strong><br>
-            <small>The bot is trained and ready. Live trading data will appear after the first trade.</small>
+        <div style="background: #f5f5f5; color: #666666; padding: 20px; border: 1px solid #e0e0e0; margin-bottom: 40px; text-align: center; font-size: 0.9em;">
+            <strong>Awaiting first trade execution at 00:01 UTC</strong><br>
+            <span style="font-size: 0.85em; color: #999999;">Model trained. Live trading data will appear after execution.</span>
         </div>
         {% endif %}
         
@@ -260,7 +296,7 @@ HTML_TEMPLATE = """
 
         <!-- Model Information -->
         <div class="section">
-            <h2>📊 Model Information</h2>
+            <h2>Model Configuration</h2>
             <div class="model-info">
                 <div class="model-stat">
                     <div class="model-stat-label">Model Type</div>
@@ -283,16 +319,17 @@ HTML_TEMPLATE = """
                     <div class="model-stat-value">{{ last_trained }}</div>
                 </div>
                 <div class="model-stat">
-                    <div class="model-stat-label">Strategy</div>
-                    <div class="model-stat-value">Daily Rebalance</div>
+                    <div class="model-stat-label">Rebalancing</div>
+                    <div class="model-stat-value">Daily 00:01 UTC</div>
                 </div>
             </div>
         </div>
 
         <!-- Recent Predictions vs Actuals -->
         <div class="section">
-            <h2>🎯 Recent Predictions vs Actuals</h2>
+            <h2>Recent Predictions vs Actuals</h2>
             {% if predictions %}
+                <div style="border: 1px solid #000000;">
                 {% for pred in predictions[-10:]|reverse %}
                 <div class="prediction-row">
                     <div class="prediction-date">{{ pred.date }}</div>
@@ -322,6 +359,7 @@ HTML_TEMPLATE = """
                     </div>
                 </div>
                 {% endfor %}
+                </div>
             {% else %}
                 <div class="no-data">No predictions yet. Waiting for first trade...</div>
             {% endif %}
@@ -329,7 +367,7 @@ HTML_TEMPLATE = """
 
         <!-- Trade History -->
         <div class="section">
-            <h2>📋 Trade Execution Log</h2>
+            <h2>Trade Execution Log</h2>
             {% if trades %}
             <table>
                 <thead>
