@@ -9,10 +9,23 @@ import json
 from pathlib import Path
 from datetime import datetime, timezone
 import os
+import sys
+
+# Import Kraken API to fetch live data
+try:
+    import kraken_futures as kf
+except ImportError:
+    kf = None
+    print("WARNING: kraken_futures not available, live data will not be fetched")
 
 app = Flask(__name__)
 
 STATE_FILE = Path("tumbler_state.json")
+
+# Kraken API credentials
+KRAKEN_API_KEY = os.getenv("KRAKEN_API_KEY")
+KRAKEN_API_SECRET = os.getenv("KRAKEN_API_SECRET")
+SYMBOL_FUTS_UC = "PF_XBTUSD"
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -360,6 +373,52 @@ HTML_TEMPLATE = """
 """
 
 
+def get_live_kraken_data():
+    """Fetch live data directly from Kraken API"""
+    if not kf or not KRAKEN_API_KEY or not KRAKEN_API_SECRET:
+        print("DEBUG: Cannot fetch live Kraken data - API not configured")
+        return None
+    
+    try:
+        api = kf.KrakenFuturesApi(KRAKEN_API_KEY, KRAKEN_API_SECRET)
+        
+        # Get portfolio value
+        accounts = api.get_accounts()
+        portfolio_value = float(accounts["accounts"]["flex"]["portfolioValue"])
+        
+        # Get mark price
+        tickers = api.get_tickers()
+        mark_price = 0
+        for t in tickers["tickers"]:
+            if t["symbol"] == SYMBOL_FUTS_UC:
+                mark_price = float(t["markPrice"])
+                break
+        
+        # Get open position
+        positions = api.get_open_positions()
+        current_position = None
+        for p in positions.get("openPositions", []):
+            if p["symbol"] == SYMBOL_FUTS_UC:
+                current_position = {
+                    "signal": "LONG" if p["side"] == "long" else "SHORT",
+                    "side": p["side"],
+                    "size_btc": abs(float(p["size"])),
+                    "fill_price": float(p.get("fillPrice", 0)),
+                }
+                break
+        
+        print(f"DEBUG: Fetched live Kraken data - portfolio=${portfolio_value:.2f}, mark=${mark_price:.2f}, position={current_position}")
+        
+        return {
+            "portfolio_value": portfolio_value,
+            "mark_price": mark_price,
+            "current_position": current_position
+        }
+    except Exception as e:
+        print(f"ERROR: Failed to fetch live Kraken data: {e}")
+        return None
+
+
 def load_state():
     if STATE_FILE.exists():
         return json.loads(STATE_FILE.read_text())
@@ -383,6 +442,27 @@ def dashboard():
     print("DEBUG: Full state loaded:")
     print(json.dumps(state, indent=2))
     print("="*80)
+    
+    # Fetch live Kraken data
+    live_data = get_live_kraken_data()
+    if live_data:
+        print(f"DEBUG: Live Kraken data available")
+        # Override state with live data
+        if live_data["current_position"]:
+            state["current_position"] = live_data["current_position"]
+        state["current_portfolio_value"] = live_data["portfolio_value"]
+        
+        # Update performance with live data
+        if state.get("starting_capital") is None and live_data["portfolio_value"] > 0:
+            state["starting_capital"] = live_data["portfolio_value"]
+        
+        if state.get("starting_capital"):
+            total_return = (live_data["portfolio_value"] - state["starting_capital"]) / state["starting_capital"] * 100
+            if "performance" not in state:
+                state["performance"] = {}
+            state["performance"]["current_value"] = live_data["portfolio_value"]
+            state["performance"]["starting_capital"] = state["starting_capital"]
+            state["performance"]["total_return_pct"] = total_return
     
     # Current position - prioritize live position from Kraken
     current_position = state.get("current_position")
@@ -483,25 +563,3 @@ def dashboard():
     
     return render_template_string(
         HTML_TEMPLATE,
-        current_signal=current_signal,
-        current_size=current_size,
-        current_price=current_price,
-        current_value=current_value,
-        starting_capital=starting_capital,
-        total_return=total_return,
-        total_return_raw=total_return_raw,
-        total_trades=total_trades,
-        today_prediction=today_prediction,
-        train_mse=train_mse,
-        lookback=lookback,
-        leverage=leverage,
-        last_trained=last_trained,
-        predictions=predictions,
-        trades=trades,
-        last_updated=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-    )
-
-
-if __name__ == '__main__':
-    port = int(os.getenv('PORT', 8080))
-    app.run(host='0.0.0.0', port=port, debug=False)
