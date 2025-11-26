@@ -11,6 +11,9 @@ from datetime import datetime, timezone
 import os
 import sys
 
+# Import state manager
+import state_manager
+
 # Import Kraken API to fetch live data
 try:
     import kraken_futures as kf
@@ -19,8 +22,6 @@ except ImportError:
     print("WARNING: kraken_futures not available, live data will not be fetched")
 
 app = Flask(__name__)
-
-STATE_FILE = Path("tumbler_state.json")
 
 # Kraken API credentials
 KRAKEN_API_KEY = os.getenv("KRAKEN_API_KEY")
@@ -458,17 +459,7 @@ def get_live_kraken_data():
 
 
 def load_state():
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
-    return {
-        "trades": [],
-        "predictions": [],
-        "starting_capital": None,
-        "performance": {},
-        "model_info": {},
-        "current_position": None,
-        "current_portfolio_value": 0
-    }
+    return state_manager.load_state()
 
 
 @app.route('/')
@@ -622,11 +613,9 @@ def dashboard():
 
 @app.route('/debug')
 def debug():
-    """Debug endpoint to check state file and live data"""
+    """Debug endpoint to check state storage and live data"""
     debug_info = {
-        "state_file_path": str(STATE_FILE.absolute()),
-        "state_file_exists": STATE_FILE.exists(),
-        "state_file_size": STATE_FILE.stat().st_size if STATE_FILE.exists() else 0,
+        "storage_info": state_manager.get_state_info(),
         "kraken_api_configured": bool(KRAKEN_API_KEY and KRAKEN_API_SECRET and kf),
         "state_content": load_state(),
         "live_kraken_data": get_live_kraken_data()
