@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 web_state.py - SMA 365 Trading Dashboard
+Autonomously fetches data from Kraken API and updates state every 5 minutes
 Displays execution logs and performance metrics
 """
 
@@ -9,10 +10,33 @@ import json
 from pathlib import Path
 from datetime import datetime, timezone
 import os
+import time
+import threading
+import logging
+from typing import Dict, Any, Optional
+
+# Import Kraken API client
+import kraken_futures as kf
 
 app = Flask(__name__)
 
 STATE_FILE = Path("sma_state.json")
+UPDATE_INTERVAL = 300  # 5 minutes in seconds
+
+# Strategy configuration
+SYMBOL_FUTS_UC = "PF_XBTUSD"
+SYMBOL_FUTS_LC = "pf_xbtusd"
+SMA_PERIOD = 365
+ATR_PERIOD = 14
+ATR_MULTIPLIER = 3.2
+LEVERAGE = 1.5
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s %(message)s",
+)
+log = logging.getLogger("web_state")
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -210,12 +234,36 @@ HTML_TEMPLATE = """
             background: #ffffff;
             color: #000000;
         }
+        .status-indicator {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+        .status-live {
+            background: #00ff00;
+        }
+            .status-offline {
+            background: #ff0000;
+        }
+        .update-info {
+            text-align: center;
+            color: #666666;
+            margin-bottom: 20px;
+            font-size: 0.85em;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>SMA 365 Trading Dashboard</h1>
         <div class="subtitle">365-Day Simple Moving Average Strategy with ATR Stop Loss</div>
+        
+        <div class="update-info">
+            <span class="status-indicator status-{{ status_class }}"></span>
+            Data updates every 5 minutes | Last update: {{ last_data_update }}
+        </div>
         
         {% if total_trades == 0 %}
         <div style="background: #f5f5f5; color: #666666; padding: 20px; border: 1px solid #e0e0e0; margin-bottom: 40px; text-align: center; font-size: 0.9em;">
@@ -274,6 +322,29 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
+        <!-- Account Information -->
+        <div class="section">
+            <h2>Account Information</h2>
+            <div class="strategy-info">
+                <div class="strategy-stat">
+                    <div class="strategy-stat-label">Account Balance</div>
+                    <div class="strategy-stat-value">${{ account_balance }}</div>
+                </div>
+                <div class="strategy-stat">
+                    <div class="strategy-stat-label">Available Margin</div>
+                    <div class="strategy-stat-value">${{ available_margin }}</div>
+                </div>
+                <div class="strategy-stat">
+                    <div class="strategy-stat-label">Used Margin</div>
+                    <div class="strategy-stat-value">${{ used_margin }}</div>
+                </div>
+                <div class="strategy-stat">
+                    <div class="strategy-stat-label">Unrealized P&L</div>
+                    <div class="strategy-stat-value {{ 'positive' if unrealized_pnl >= 0 else 'negative' }}">${{ unrealized_pnl }}</div>
+                </div>
+            </div>
+        </div>
+
         <!-- Trade History -->
         <div class="section">
             <h2>Trade Execution Log</h2>
@@ -322,76 +393,258 @@ HTML_TEMPLATE = """
 """
 
 
+class KrakenDataFetcher:
+    def __init__(self):
+        self.api_key = os.getenv("KRAKEN_API_KEY")
+        self.api_secret = os.getenv("KRAKEN_API_SECRET")
+        self.api = None
+        self.initialize_api()
+    
+    def initialize_api(self):
+        """Initialize Kraken API client"""
+        if self.api_key and self.api_secret:
+            try:
+                self.api = kf.KrakenFuturesApi(self.api_key, self.api_secret)
+                log.info("Kraken API client initialized successfully")
+            except Exception as e:
+                log.error(f"Failed to initialize Kraken API: {e}")
+                self.api = None
+        else:
+            log.warning("Kraken API credentials not found in environment variables")
+            self.api = None
+    
+    def get_portfolio_value(self) -> float:
+        """Get current portfolio value in USD"""
+        if not self.api:
+            return 0.0
+        
+        try:
+            accounts = self.api.get_accounts()
+            return float(accounts["accounts"]["flex"]["portfolioValue"])
+        except Exception as e:
+            log.error(f"Failed to get portfolio value: {e}")
+            return 0.0
+    
+    def get_mark_price(self) -> float:
+        """Get current mark price for BTC"""
+        if not self.api:
+            return 0.0
+        
+        try:
+            tickers = self.api.get_tickers()
+            for ticker in tickers["tickers"]:
+                if ticker["symbol"] == SYMBOL_FUTS_UC:
+                    return float(ticker["markPrice"])
+            return 0.0
+        except Exception as e:
+            log.error(f"Failed to get mark price: {e}")
+            return 0.0
+    
+    def get_current_position(self) -> Optional[Dict[str, Any]]:
+        """Get current open position from Kraken"""
+        if not self.api:
+            return None
+        
+        try:
+            positions = self.api.get_open_positions()
+            for position in positions.get("openPositions", []):
+                if position["symbol"] == SYMBOL_FUTS_UC:
+                    return {
+                        "signal": "LONG" if position["side"] == "long" else "SHORT",
+                        "side": position["side"],
+                        "size_btc": abs(float(position["size"])),
+                        "fill_price": float(position.get("fillPrice", 0)),
+                        "unrealized_pnl": float(position.get("unrealizedFunding", 0)),
+                    }
+            return None
+        except Exception as e:
+            log.error(f"Failed to get current position: {e}")
+            return None
+    
+    def get_account_balance(self) -> Dict[str, float]:
+        """Get account balance information"""
+        if not self.api:
+            return {"balance": 0.0, "available_margin": 0.0, "used_margin": 0.0}
+        
+        try:
+            accounts = self.api.get_accounts()
+            flex_account = accounts["accounts"]["flex"]
+            return {
+                "balance": float(flex_account.get("balance", 0)),
+                "available_margin": float(flex_account.get("availableMargin", 0)),
+                "used_margin": float(flex_account.get("usedMargin", 0)),
+            }
+        except Exception as e:
+            log.error(f"Failed to get account balance: {e}")
+            return {"balance": 0.0, "available_margin": 0.0, "used_margin": 0.0}
+    
+    def get_trade_history(self) -> list:
+        """Get recent trade history"""
+        if not self.api:
+            return []
+        
+        try:
+            # Get recent fills (trades)
+            fills = self.api.get_fills({"limit": 50})
+            return fills.get("fills", [])
+        except Exception as e:
+            log.error(f"Failed to get trade history: {e}")
+            return []
+
+
 def load_state():
+    """Load state from file"""
     if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except Exception as e:
+            log.error(f"Failed to load state file: {e}")
+    
+    # Return default state
     return {
         "trades": [],
         "starting_capital": None,
         "performance": {},
         "strategy_info": {},
         "current_position": None,
-        "current_portfolio_value": 0
+        "current_portfolio_value": 0,
+        "account_balance": {},
+        "last_update": None
     }
+
+
+def save_state(state: Dict[str, Any]):
+    """Save state to file"""
+    try:
+        STATE_FILE.write_text(json.dumps(state, indent=2))
+        log.info(f"State file updated at {datetime.now(timezone.utc).isoformat()}")
+    except Exception as e:
+        log.error(f"Failed to save state file: {e}")
+
+
+def update_state_from_kraken():
+    """Fetch data from Kraken API and update state file"""
+    log.info("Updating state from Kraken API...")
+    
+    fetcher = KrakenDataFetcher()
+    state = load_state()
+    
+    # Get current data from Kraken
+    portfolio_value = fetcher.get_portfolio_value()
+    current_position = fetcher.get_current_position()
+    account_balance = fetcher.get_account_balance()
+    mark_price = fetcher.get_mark_price()
+    
+    # Update state with current data
+    state["current_portfolio_value"] = portfolio_value
+    state["current_position"] = current_position
+    state["account_balance"] = account_balance
+    state["last_update"] = datetime.now(timezone.utc).isoformat()
+    
+    # Initialize starting capital if not set
+    if state["starting_capital"] is None and portfolio_value > 0:
+        state["starting_capital"] = portfolio_value
+        log.info(f"Initialized starting capital: ${portfolio_value:.2f}")
+    
+    # Calculate performance metrics
+    if state["starting_capital"] and portfolio_value > 0:
+        total_return_pct = (portfolio_value - state["starting_capital"]) / state["starting_capital"] * 100
+        state["performance"] = {
+            "current_value": portfolio_value,
+            "starting_capital": state["starting_capital"],
+            "total_return_pct": total_return_pct,
+            "total_trades": len(state.get("trades", [])),
+        }
+    
+    # Update strategy info
+    state["strategy_info"] = {
+        "sma_period": SMA_PERIOD,
+        "atr_period": ATR_PERIOD,
+        "atr_multiplier": ATR_MULTIPLIER,
+        "leverage": LEVERAGE,
+        "last_updated": datetime.now(timezone.utc).isoformat()
+    }
+    
+    # Save updated state
+    save_state(state)
+    
+    # Log update
+    if current_position:
+        log.info(f"Position: {current_position['signal']} {current_position['size_btc']:.4f} BTC @ ${current_position['fill_price']:.2f}")
+    else:
+        log.info("No current position")
+    
+    log.info(f"Portfolio: ${portfolio_value:.2f} | Mark: ${mark_price:.2f}")
+
+
+def background_updater():
+    """Background thread to update state every 5 minutes"""
+    while True:
+        try:
+            update_state_from_kraken()
+        except Exception as e:
+            log.error(f"Background update failed: {e}")
+        
+        # Wait 5 minutes
+        time.sleep(UPDATE_INTERVAL)
 
 
 @app.route('/')
 def dashboard():
     state = load_state()
     
-    # Debug logging
-    app.logger.info(f"State loaded: {len(state)} keys")
-    app.logger.info(f"Current portfolio value: {state.get('current_portfolio_value')}")
-    app.logger.info(f"Starting capital: {state.get('starting_capital')}")
-    app.logger.info(f"Performance: {state.get('performance')}")
-    app.logger.info(f"Number of trades: {len(state.get('trades', []))}")
+    # Determine status
+    last_update = state.get("last_update")
+    if last_update:
+        try:
+            last_dt = datetime.fromisoformat(last_update.replace('Z', '+00:00'))
+            age = (datetime.now(timezone.utc) - last_dt).total_seconds()
+            status_class = "live" if age < UPDATE_INTERVAL * 2 else "offline"
+            last_data_update = last_dt.strftime('%Y-%m-%d %H:%M:%S')
+        except:
+            status_class = "offline"
+            last_data_update = "Never"
+    else:
+        status_class = "offline"
+        last_data_update = "Never"
     
-    # Current position - prioritize live position from Kraken
+    # Current position
     current_position = state.get("current_position")
-    current_signal = "N/A"
+    current_signal = "FLAT"
     current_size = "0.0000"
     current_price = "0.00"
+    unrealized_pnl = 0.0
     
     if current_position:
-        # Use live position from Kraken
         current_signal = current_position["signal"]
         current_size = f"{current_position['size_btc']:.4f}"
         current_price = f"{current_position['fill_price']:.2f}"
-    elif state["trades"]:
-        # Fall back to last trade if no live position
-        last_trade = state["trades"][-1]
-        current_signal = last_trade["signal"]
-        current_size = f"{last_trade['size_btc']:.4f}"
-        current_price = f"{last_trade['fill_price']:.2f}"
+        unrealized_pnl = current_position.get("unrealized_pnl", 0)
     
-    # Performance metrics - use live portfolio value if available
+    # Performance metrics
     performance = state.get("performance", {})
     current_value_raw = state.get("current_portfolio_value", performance.get('current_value', 0))
-    
-    # If still zero, try to get from last trade
-    if current_value_raw == 0 and state.get("trades"):
-        current_value_raw = state["trades"][-1].get("portfolio_value", 0)
-    
     current_value = f"{current_value_raw:.2f}" if current_value_raw else "0.00"
     
     starting_capital_raw = performance.get('starting_capital') or state.get('starting_capital') or 0
     starting_capital = f"{starting_capital_raw:.2f}" if starting_capital_raw else "0.00"
     
     total_return_raw = performance.get('total_return_pct', 0)
-    
-    # Calculate return if we have values but no calculated return
-    if total_return_raw == 0 and starting_capital_raw and current_value_raw:
-        total_return_raw = (current_value_raw - starting_capital_raw) / starting_capital_raw * 100
-    
     total_return = f"{total_return_raw:.2f}" if total_return_raw else "0.00"
     total_trades = performance.get('total_trades', len(state.get("trades", [])))
     
     # Strategy info
     strategy_info = state.get("strategy_info", {})
-    sma_period = strategy_info.get('sma_period', 365)
-    atr_period = strategy_info.get('atr_period', 14)
-    atr_multiplier = strategy_info.get('atr_multiplier', 3.2)
-    leverage = strategy_info.get('leverage', 1.5)
+    sma_period = strategy_info.get('sma_period', SMA_PERIOD)
+    atr_period = strategy_info.get('atr_period', ATR_PERIOD)
+    atr_multiplier = strategy_info.get('atr_multiplier', ATR_MULTIPLIER)
+    leverage = strategy_info.get('leverage', LEVERAGE)
+    
+    # Account balance
+    account_balance_info = state.get("account_balance", {})
+    account_balance = f"{account_balance_info.get('balance', 0):.2f}"
+    available_margin = f"{account_balance_info.get('available_margin', 0):.2f}"
+    used_margin = f"{account_balance_info.get('used_margin', 0):.2f}"
     
     # Format trades
     trades = []
@@ -424,11 +677,29 @@ def dashboard():
         atr_period=atr_period,
         atr_multiplier=atr_multiplier,
         leverage=leverage,
+        account_balance=account_balance,
+        available_margin=available_margin,
+        used_margin=used_margin,
+        unrealized_pnl=unrealized_pnl,
         trades=trades,
-        last_updated=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        last_updated=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
+        last_data_update=last_data_update,
+        status_class=status_class
     )
 
 
+def start_background_updater():
+    """Start the background update thread"""
+    updater_thread = threading.Thread(target=background_updater, daemon=True)
+    updater_thread.start()
+    log.info("Background state updater started")
+
+
 if __name__ == '__main__':
+    # Start background updater
+    start_background_updater()
+    
+    # Run Flask app
     port = int(os.getenv('PORT', 8080))
+    log.info(f"Starting web dashboard on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
