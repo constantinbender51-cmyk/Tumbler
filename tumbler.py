@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-tumbler.py - SMA 365 BTC Trading Strategy
-Uses 365-day SMA with ATR-based stop loss
-Trades daily at 00:01 UTC: LONG if price > SMA 365, otherwise SHORT
+tumbler.py - LSTM-based BTC Trading Strategy
+Uses LSTM neural network with 20-day lookback and on-chain metrics
+Trades daily at 00:01 UTC based on predicted vs actual price comparison
 """
 
 import json
@@ -16,10 +16,16 @@ from typing import Dict, Tuple
 import subprocess
 import numpy as np
 import pandas as pd
+import requests
 
 import kraken_futures as kf
 import kraken_ohlc
 import binance_ohlc
+
+from sklearn.preprocessing import StandardScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Input
+from tensorflow.keras.optimizers import Adam
 
 dry = os.getenv("DRY_RUN", "false").lower() in {"1", "true", "yes"}
 RUN_TRADE_NOW = os.getenv("RUN_TRADE_NOW", "false").lower() in {"1", "true", "yes"}
@@ -30,69 +36,247 @@ SYMBOL_OHLC_KRAKEN = "XBTUSD"
 SYMBOL_OHLC_BINANCE = "BTCUSDT"
 INTERVAL_KRAKEN = 1440
 INTERVAL_BINANCE = "1d"
-SMA_PERIOD = 365
-ATR_PERIOD = 14
-ATR_MULTIPLIER = 3.2
-LEV = 1.5
-STATE_FILE = Path("sma_state.json")
+LOOKBACK = 20
+LEV = 5.0
+STOP_LOSS_PCT = 0.05  # 5% stop loss
+STATE_FILE = Path("tumbler_state.json")
 TEST_SIZE_BTC = 0.0001
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s %(message)s",
 )
-log = logging.getLogger("sma_strategy")
+log = logging.getLogger("tumbler")
 
 
-def calculate_sma_and_atr(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculate 365-day SMA and 14-day ATR"""
+def fetch_onchain_metrics(start_date: str = "2022-08-10") -> pd.DataFrame:
+    """Fetch on-chain metrics from Blockchain.info API"""
+    BASE_URL = "https://api.blockchain.info/charts/"
+    METRICS = {
+        'Active_Addresses': 'n-unique-addresses',
+        'Net_Transaction_Count': 'n-transactions',
+        'Transaction_Volume_USD': 'estimated-transaction-volume-usd',
+    }
+    
+    all_data = []
+    for metric_name, chart_endpoint in METRICS.items():
+        log.info(f"Fetching {metric_name}...")
+        params = {
+            'format': 'json',
+            'start': start_date,
+            'timespan': '2years',
+            'rollingAverage': '1d'
+        }
+        url = f"{BASE_URL}{chart_endpoint}"
+        try:
+            response = requests.get(url, params=params, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            if 'values' in data and data['values']:
+                df = pd.DataFrame(data['values'])
+                df['date'] = pd.to_datetime(df['x'], unit='s', utc=True).dt.tz_localize(None)
+                df = df.set_index('date')['y'].rename(metric_name)
+                all_data.append(df)
+                log.info(f"Fetched {len(df)} rows for {metric_name}")
+            time.sleep(2)  # Rate limiting
+        except Exception as e:
+            log.warning(f"Failed to fetch {metric_name}: {e}")
+            # Return empty series if fetch fails
+            all_data.append(pd.Series(name=metric_name, dtype=float))
+    
+    if all_data:
+        return pd.concat(all_data, axis=1)
+    return pd.DataFrame()
+
+
+def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculate technical indicators matching the app.py specification"""
     df = df.copy()
     
-    # Calculate 365-day SMA
-    df['sma_365'] = df['close'].rolling(window=SMA_PERIOD).mean()
+    # Ensure index is datetime
+    if not isinstance(df.index, pd.DatetimeIndex):
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+            df.set_index('date', inplace=True)
+        elif 'timestamp' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df.set_index('timestamp', inplace=True)
+        else:
+            raise ValueError("DataFrame must have a datetime index or 'date'/'timestamp' column")
     
-    # Calculate True Range
-    df['tr'] = np.maximum(
-        df['high'] - df['low'],
-        np.maximum(
-            abs(df['high'] - df['close'].shift(1)),
-            abs(df['low'] - df['close'].shift(1))
-        )
-    )
+    # 3-day SMA for close price
+    df['sma_3_close'] = df['close'].rolling(window=3).mean()
     
-    # Calculate 14-day ATR
-    df['atr'] = df['tr'].rolling(window=ATR_PERIOD).mean()
+    # 9-day SMA for close price
+    df['sma_9_close'] = df['close'].rolling(window=9).mean()
+    
+    # 3-day EMA for volume
+    df['ema_3_volume'] = df['volume'].ewm(span=3, adjust=False).mean()
+    
+    # MACD (12,26,9)
+    ema_12 = df['close'].ewm(span=12, adjust=False).mean()
+    ema_26 = df['close'].ewm(span=26, adjust=False).mean()
+    df['macd_line'] = ema_12 - ema_26
+    df['signal_line'] = df['macd_line'].ewm(span=9, adjust=False).mean()
+    
+    # Stochastic RSI (14,3,3)
+    rsi_period = 14
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=rsi_period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=rsi_period).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    
+    rsi_min = rsi.rolling(window=14).min()
+    rsi_max = rsi.rolling(window=14).max()
+    df['stoch_rsi'] = 100 * (rsi - rsi_min) / (rsi_max - rsi_min)
+    
+    # Day of week (1-7)
+    df['day_of_week'] = df.index.dayofweek + 1
     
     return df
 
 
-def generate_signal(df: pd.DataFrame, current_price: float) -> Tuple[str, float, float]:
-    """
-    Generate trading signal based on SMA 365
-    Returns: (signal, sma_365, atr)
-    """
-    df_calc = calculate_sma_and_atr(df)
+def prepare_lstm_features(df: pd.DataFrame, onchain_df: pd.DataFrame = None) -> Tuple[np.ndarray, np.ndarray, StandardScaler]:
+    """Prepare features for LSTM model with 20-day lookback"""
+    df = calculate_technical_indicators(df)
     
-    # Get latest values
-    sma_365 = df_calc['sma_365'].iloc[-1]
-    atr = df_calc['atr'].iloc[-1]
+    # Merge with on-chain data if available
+    if onchain_df is not None and not onchain_df.empty:
+        df = df.join(onchain_df, how='left')
+        df = df.ffill()
     
-    # Check if we have valid values
-    if pd.isna(sma_365) or pd.isna(atr):
-        raise ValueError("Not enough historical data for SMA 365 or ATR calculation")
+    # Ensure on-chain columns exist (fill with 0 if not available)
+    for col in ['Active_Addresses', 'Net_Transaction_Count', 'Transaction_Volume_USD']:
+        if col not in df.columns:
+            df[col] = 0
     
-    # Generate signal
-    if current_price > sma_365:
-        signal = "LONG"
-    else:
-        signal = "SHORT"
+    df_clean = df.dropna()
     
-    log.info(f"Current price: ${current_price:.2f}")
-    log.info(f"SMA 365: ${sma_365:.2f}")
-    log.info(f"ATR (14-day): ${atr:.2f}")
-    log.info(f"Signal: {signal}")
+    features = []
+    targets = []
     
-    return signal, sma_365, atr
+    for i in range(len(df_clean)):
+        if i >= 40:  # Ensure enough history
+            feature = []
+            # Add features from the last 20 days (t-20 to t-1)
+            for lookback in range(1, 21):
+                if i - lookback >= 0:
+                    feature.append(df_clean['sma_3_close'].iloc[i - lookback])
+                    feature.append(df_clean['sma_9_close'].iloc[i - lookback])
+                    feature.append(df_clean['ema_3_volume'].iloc[i - lookback])
+                    feature.append(df_clean['macd_line'].iloc[i - lookback])
+                    feature.append(df_clean['signal_line'].iloc[i - lookback])
+                    feature.append(df_clean['stoch_rsi'].iloc[i - lookback])
+                    feature.append(df_clean['day_of_week'].iloc[i - lookback])
+                    feature.append(df_clean['Net_Transaction_Count'].iloc[i - lookback])
+                    feature.append(df_clean['Transaction_Volume_USD'].iloc[i - lookback])
+                    feature.append(df_clean['Active_Addresses'].iloc[i - lookback])
+                else:
+                    feature.extend([0] * 10)
+            
+            features.append(feature)
+            targets.append(df_clean['close'].iloc[i])
+    
+    features = np.array(features)
+    targets = np.array(targets)
+    
+    # Remove rows with NaN
+    valid_indices = ~np.isnan(features).any(axis=1)
+    features = features[valid_indices]
+    targets = targets[valid_indices]
+    
+    # Normalize features
+    scaler = StandardScaler()
+    features_normalized = scaler.fit_transform(features)
+    
+    return features_normalized, targets, scaler
+
+
+class LSTMModel:
+    def __init__(self):
+        self.model = None
+        self.scaler = None
+        self.train_mse = None
+        self.last_trained = None
+        
+    def build_model(self):
+        """Build LSTM model matching app.py specification"""
+        model = Sequential()
+        model.add(Input(shape=(20, 10)))
+        model.add(LSTM(100, activation='relu', return_sequences=True))
+        model.add(LSTM(100, activation='relu', return_sequences=True))
+        model.add(LSTM(100, activation='relu'))
+        model.add(Dense(1))
+        model.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
+        return model
+    
+    def fit(self, df: pd.DataFrame, onchain_df: pd.DataFrame = None):
+        """Train LSTM model on historical data"""
+        log.info("Preparing features for LSTM training...")
+        features, targets, scaler = prepare_lstm_features(df, onchain_df)
+        self.scaler = scaler
+        
+        # 80/20 split for training
+        split_idx = int(len(features) * 0.8)
+        X_train = features[:split_idx]
+        y_train = targets[:split_idx]
+        
+        # Reshape for LSTM: (samples, time_steps, features)
+        X_train_reshaped = X_train.reshape(X_train.shape[0], 20, 10)
+        
+        log.info(f"Training LSTM on {len(X_train)} samples...")
+        self.model = self.build_model()
+        self.model.fit(X_train_reshaped, y_train, epochs=50, batch_size=32, verbose=0)
+        
+        # Calculate training MSE
+        train_predictions = self.model.predict(X_train_reshaped, verbose=0).flatten()
+        self.train_mse = np.mean((y_train - train_predictions) ** 2)
+        self.last_trained = datetime.now(timezone.utc).isoformat()
+        
+        log.info(f"Training complete. MSE: {self.train_mse:.2f}")
+    
+    def predict_last(self, df: pd.DataFrame, onchain_df: pd.DataFrame = None) -> float:
+        """Predict closing price for the last available data point"""
+        df_calc = calculate_technical_indicators(df)
+        
+        if onchain_df is not None and not onchain_df.empty:
+            df_calc = df_calc.join(onchain_df, how='left')
+            df_calc = df_calc.ffill()
+        
+        for col in ['Active_Addresses', 'Net_Transaction_Count', 'Transaction_Volume_USD']:
+            if col not in df_calc.columns:
+                df_calc[col] = 0
+        
+        df_calc = df_calc.dropna()
+        
+        if len(df_calc) < 40:
+            raise ValueError("Not enough data for prediction")
+        
+        # Build feature for last row
+        i = len(df_calc) - 1
+        feature = []
+        for lookback in range(1, 21):
+            if i - lookback >= 0:
+                feature.append(df_calc['sma_3_close'].iloc[i - lookback])
+                feature.append(df_calc['sma_9_close'].iloc[i - lookback])
+                feature.append(df_calc['ema_3_volume'].iloc[i - lookback])
+                feature.append(df_calc['macd_line'].iloc[i - lookback])
+                feature.append(df_calc['signal_line'].iloc[i - lookback])
+                feature.append(df_calc['stoch_rsi'].iloc[i - lookback])
+                feature.append(df_calc['day_of_week'].iloc[i - lookback])
+                feature.append(df_calc['Net_Transaction_Count'].iloc[i - lookback])
+                feature.append(df_calc['Transaction_Volume_USD'].iloc[i - lookback])
+                feature.append(df_calc['Active_Addresses'].iloc[i - lookback])
+            else:
+                feature.extend([0] * 10)
+        
+        feature = np.array([feature])
+        feature_normalized = self.scaler.transform(feature)
+        feature_reshaped = feature_normalized.reshape(1, 20, 10)
+        
+        prediction = self.model.predict(feature_reshaped, verbose=0)[0][0]
+        return float(prediction)
 
 
 def portfolio_usd(api: kf.KrakenFuturesApi) -> float:
@@ -131,21 +315,18 @@ def flatten_position(api: kf.KrakenFuturesApi):
         })
 
 
-def place_stop(api: kf.KrakenFuturesApi, side: str, size_btc: float, fill_price: float, atr: float):
-    """Place ATR-based stop loss"""
-    stop_distance = ATR_MULTIPLIER * atr
-    
+def place_stop_loss(api: kf.KrakenFuturesApi, side: str, size_btc: float, fill_price: float):
+    """Place 5% stop loss"""
     if side == "buy":
-        stop_price = fill_price - stop_distance
+        stop_price = fill_price * (1 - STOP_LOSS_PCT)
         stop_side = "sell"
-        limit_price = stop_price * 0.9999
     else:
-        stop_price = fill_price + stop_distance
+        stop_price = fill_price * (1 + STOP_LOSS_PCT)
         stop_side = "buy"
-        limit_price = stop_price * 1.0001
     
-    log.info(f"Placing ATR stop: {stop_side} at ${stop_price:.2f} (distance: ${stop_distance:.2f})")
+    limit_price = stop_price * (0.9999 if stop_side == "sell" else 1.0001)
     
+    log.info("Placing %d%% stop loss: %s at %.2f", int(STOP_LOSS_PCT*100), stop_side, stop_price)
     api.send_order({
         "orderType": "stp",
         "symbol": SYMBOL_FUTS_LC,
@@ -194,13 +375,6 @@ def smoke_test(api: kf.KrakenFuturesApi):
         else:
             log.info("No open positions")
         
-        # Test historical data
-        df = kraken_ohlc.get_ohlc(SYMBOL_OHLC_KRAKEN, INTERVAL_KRAKEN)
-        log.info(f"Historical data: {len(df)} days available")
-        
-        if len(df) < SMA_PERIOD:
-            log.warning(f"Only {len(df)} days available, need {SMA_PERIOD} for SMA calculation")
-        
         log.info("=== Smoke-test complete ===")
         return True
     except Exception as e:
@@ -211,11 +385,11 @@ def smoke_test(api: kf.KrakenFuturesApi):
 def load_state() -> Dict:
     return json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {
         "trades": [],
+        "predictions": [],
         "starting_capital": None,
         "performance": {},
         "current_position": None,
-        "current_portfolio_value": 0,
-        "strategy_info": {}
+        "current_portfolio_value": 0
     }
 
 
@@ -237,7 +411,6 @@ def update_state_with_current_position(api: kf.KrakenFuturesApi):
     
     if state["starting_capital"] is None:
         state["starting_capital"] = portfolio_value
-        log.info(f"Initialized starting capital: ${portfolio_value:.2f}")
     
     # Calculate performance if we have starting capital
     if state["starting_capital"]:
@@ -249,26 +422,43 @@ def update_state_with_current_position(api: kf.KrakenFuturesApi):
             "total_trades": len(state.get("trades", [])),
         }
     
-    # Ensure strategy_info exists
-    if "strategy_info" not in state:
-        state["strategy_info"] = {
-            "sma_period": SMA_PERIOD,
-            "atr_period": ATR_PERIOD,
-            "atr_multiplier": ATR_MULTIPLIER,
-            "leverage": LEV,
-            "last_updated": datetime.now(timezone.utc).isoformat()
-        }
-    
     save_state(state)
     log.info(f"Updated state with current position and portfolio value: ${portfolio_value:.2f}")
+
+
+def generate_signal(model: LSTMModel, df_current: pd.DataFrame, onchain_df: pd.DataFrame) -> Tuple[str, float, float, float]:
+    """
+    Generate trading signal based on yesterday's prediction vs actual
+    Returns: (signal, today_prediction, yesterday_prediction, yesterday_actual)
+    """
+    # Need at least 2 days to compare yesterday's prediction vs actual
+    if len(df_current) < 2:
+        raise ValueError("Need at least 2 days of data")
     
-    if current_pos:
-        log.info(f"Current position: {current_pos['signal']} {current_pos['size_btc']:.4f} BTC @ ${current_pos['fill_price']:.2f}")
+    # Get yesterday's actual price
+    yesterday_actual = float(df_current['close'].iloc[-2])
+    
+    # Get yesterday's data and predict
+    df_yesterday = df_current.iloc[:-1]
+    yesterday_prediction = model.predict_last(df_yesterday, onchain_df)
+    
+    # Get today's prediction
+    today_prediction = model.predict_last(df_current, onchain_df)
+    
+    # Generate signal
+    if yesterday_prediction > yesterday_actual:
+        signal = "LONG"
     else:
-        log.info("No current position")
+        signal = "SHORT"
+    
+    log.info(f"Yesterday: predicted={yesterday_prediction:.2f}, actual={yesterday_actual:.2f}")
+    log.info(f"Today: predicted={today_prediction:.2f}")
+    log.info(f"Signal: {signal}")
+    
+    return signal, today_prediction, yesterday_prediction, yesterday_actual
 
 
-def daily_trade(api: kf.KrakenFuturesApi):
+def daily_trade(api: kf.KrakenFuturesApi, model: LSTMModel, onchain_df: pd.DataFrame):
     """Execute daily trading strategy"""
     state = load_state()
     
@@ -282,7 +472,7 @@ def daily_trade(api: kf.KrakenFuturesApi):
         state["starting_capital"] = portfolio_value
     
     # Generate signal
-    signal, sma_365, atr = generate_signal(df, current_price)
+    signal, today_pred, yesterday_pred, yesterday_actual = generate_signal(model, df, onchain_df)
     
     # Close existing position
     log.info("Closing any existing positions...")
@@ -297,10 +487,10 @@ def daily_trade(api: kf.KrakenFuturesApi):
     
     side = "buy" if signal == "LONG" else "sell"
     
-    log.info(f"Opening {signal} position: {side} {size_btc} BTC at ~${current_price:.2f}")
+    log.info(f"Opening {signal} position: {side} {size_btc} BTC at ~{current_price:.2f}")
     
     if dry:
-        log.info(f"DRY-RUN: {signal} {size_btc} BTC at ${current_price:.2f}")
+        log.info(f"DRY-RUN: {signal} {size_btc} BTC at {current_price:.2f}")
         fill_price = current_price
     else:
         ord = api.send_order({
@@ -311,8 +501,8 @@ def daily_trade(api: kf.KrakenFuturesApi):
         })
         fill_price = float(ord.get("price", current_price))
         
-        # Place ATR-based stop loss
-        place_stop(api, side, size_btc, fill_price, atr)
+        # Place stop loss
+        place_stop_loss(api, side, size_btc, fill_price)
     
     # Record trade
     trade_record = {
@@ -322,12 +512,21 @@ def daily_trade(api: kf.KrakenFuturesApi):
         "size_btc": size_btc,
         "fill_price": fill_price,
         "portfolio_value": collateral,
-        "sma_365": sma_365,
-        "atr": atr,
-        "stop_distance": ATR_MULTIPLIER * atr,
+        "today_prediction": today_pred,
+        "yesterday_prediction": yesterday_pred,
+        "yesterday_actual": yesterday_actual,
     }
     
     state["trades"].append(trade_record)
+    state["predictions"].append({
+        "date": df.index[-1].isoformat(),
+        "predicted": today_pred,
+        "actual": None,  # Will be filled next day
+    })
+    
+    # Update yesterday's actual if exists
+    if len(state["predictions"]) > 1:
+        state["predictions"][-2]["actual"] = yesterday_actual
     
     # Calculate performance
     if state["starting_capital"]:
@@ -339,14 +538,14 @@ def daily_trade(api: kf.KrakenFuturesApi):
             "total_trades": len(state["trades"]),
         }
     
-    # Update strategy info
-    state["strategy_info"] = {
-        "sma_period": SMA_PERIOD,
-        "atr_period": ATR_PERIOD,
-        "atr_multiplier": ATR_MULTIPLIER,
-        "leverage": LEV,
-        "last_updated": datetime.now(timezone.utc).isoformat()
+    # Update current position in state
+    state["current_position"] = {
+        "signal": signal,
+        "side": side,
+        "size_btc": size_btc,
+        "fill_price": fill_price,
     }
+    state["current_portfolio_value"] = collateral
     
     save_state(state)
     log.info(f"Trade executed and logged. Portfolio: ${collateral:.2f}")
@@ -371,40 +570,55 @@ def main():
         sys.exit(1)
 
     api = kf.KrakenFuturesApi(api_key, api_sec)
+
+    # Fetch training data
+    log.info("Fetching Binance historical data for training...")
+    df_train = binance_ohlc.get_ohlc_for_training(
+        symbol=SYMBOL_OHLC_BINANCE,
+        interval=INTERVAL_BINANCE
+    )
+    log.info(f"Training on {len(df_train)} days of Binance data")
     
-    log.info("Initializing strategy and state...")
+    # Fetch on-chain metrics
+    log.info("Fetching on-chain metrics...")
+    onchain_df = fetch_onchain_metrics()
     
-    # Run smoke test first
-    if not smoke_test(api):
-        log.error("Smoke test failed, exiting")
-        sys.exit(1)
+    # Train model
+    log.info("Training LSTM model...")
+    model = LSTMModel()
+    model.fit(df_train, onchain_df)
     
-    # Update state with current position - this creates the state file
+    # Save model info to state
+    state = load_state()
+    state["model_info"] = {
+        "train_mse": model.train_mse,
+        "last_trained": model.last_trained,
+        "lookback": LOOKBACK,
+        "leverage": LEV,
+    }
+    save_state(state)
+    
+    # Run smoke test
+    log.info("Running smoke test...")
+    smoke_test(api)
+    
+    # Update state with current position
     update_state_with_current_position(api)
-    
-    log.info("State file initialized with current portfolio data")
-    
-    # Ensure state file exists and is written
-    if STATE_FILE.exists():
-        log.info(f"State file confirmed at: {STATE_FILE.absolute()}")
-    else:
-        log.error("State file was not created!")
 
     if RUN_TRADE_NOW:
         log.info("RUN_TRADE_NOW=true – executing trade now")
         try:
-            daily_trade(api)
+            daily_trade(api, model, onchain_df)
         except Exception as exc:
             log.exception("Immediate trade failed: %s", exc)
 
     log.info("Starting web dashboard on port %s", os.getenv("PORT", 8080))
-    time.sleep(1)  # Give state file time to be fully written
     subprocess.Popen([sys.executable, "web_state.py"])
 
     while True:
         wait_until_00_01_utc()
         try:
-            daily_trade(api)
+            daily_trade(api, model, onchain_df)
         except KeyboardInterrupt:
             log.info("Interrupted")
             break
