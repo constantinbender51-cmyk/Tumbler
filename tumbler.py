@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 tumbler.py - SMA 365 + 120 BTC Trading Strategy
-Uses 365-day SMA with 120-day SMA filter and ATR-based stop loss
+Uses 365-day SMA with 120-day SMA filter and 5% static stop loss
 Trades daily at 00:01 UTC:
 - LONG if price > SMA 365 AND price > SMA 120
 - SHORT if price < SMA 365 AND price < SMA 120
@@ -15,7 +15,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 import subprocess
 import numpy as np
 import pandas as pd
@@ -36,8 +36,10 @@ INTERVAL_BINANCE = "1d"
 SMA_PERIOD_LONG = 365  # Primary trend indicator
 SMA_PERIOD_SHORT = 120  # Trend filter
 ATR_PERIOD = 14
-ATR_MULTIPLIER = 3.2
-LEV = 1.5
+STATIC_STOP_PCT = 0.05  # 5% static stop loss
+LEV = 4  # 4x leverage
+LIMIT_OFFSET_PCT = 0.0002  # 0.02% offset for limit orders
+STOP_WAIT_TIME = 600  # Wait 10 minutes before placing stop loss
 STATE_FILE = Path("sma_state.json")
 TEST_SIZE_BTC = 0.0001
 
@@ -139,48 +141,7 @@ def cancel_all(api: kf.KrakenFuturesApi):
         log.warning("cancel_all_orders failed: %s", e)
 
 
-def flatten_position(api: kf.KrakenFuturesApi):
-    pos = api.get_open_positions()
-    for p in pos.get("openPositions", []):
-        if p["symbol"] != SYMBOL_FUTS_UC:
-            continue
-        side = "sell" if p["side"] == "long" else "buy"
-        size = abs(float(p["size"]))
-        log.info("Flatten %s position %.4f BTC", p["side"], size)
-        api.send_order({
-            "orderType": "mkt",
-            "symbol": SYMBOL_FUTS_LC,
-            "side": side,
-            "size": round(size, 4),
-        })
-
-
-def place_stop(api: kf.KrakenFuturesApi, side: str, size_btc: float, fill_price: float, atr: float):
-    """Place ATR-based stop loss"""
-    stop_distance = ATR_MULTIPLIER * atr
-    
-    if side == "buy":
-        stop_price = fill_price - stop_distance
-        stop_side = "sell"
-        limit_price = stop_price * 0.9999
-    else:
-        stop_price = fill_price + stop_distance
-        stop_side = "buy"
-        limit_price = stop_price * 1.0001
-    
-    log.info(f"Placing ATR stop: {stop_side} at ${stop_price:.2f} (distance: ${stop_distance:.2f})")
-    
-    api.send_order({
-        "orderType": "stp",
-        "symbol": SYMBOL_FUTS_LC,
-        "side": stop_side,
-        "size": round(size_btc, 4),
-        "stopPrice": int(round(stop_price)),
-        "limitPrice": int(round(limit_price)),
-    })
-
-
-def get_current_position(api: kf.KrakenFuturesApi) -> Dict:
+def get_current_position(api: kf.KrakenFuturesApi) -> Optional[Dict]:
     """Get current open position from Kraken"""
     try:
         pos = api.get_open_positions()
@@ -196,6 +157,159 @@ def get_current_position(api: kf.KrakenFuturesApi) -> Dict:
     except Exception as e:
         log.warning(f"Failed to get position: {e}")
         return None
+
+
+def flatten_position_limit(api: kf.KrakenFuturesApi, current_price: float):
+    """Flatten position with limit order (0.02% in favorable direction)"""
+    pos = get_current_position(api)
+    if not pos:
+        log.info("No position to flatten")
+        return
+    
+    side = "sell" if pos["side"] == "long" else "buy"
+    size = pos["size_btc"]
+    
+    # Calculate limit price: favorable direction + 0.02%
+    if side == "sell":
+        # Selling: place limit above market
+        limit_price = current_price * (1 + LIMIT_OFFSET_PCT)
+    else:
+        # Buying: place limit below market
+        limit_price = current_price * (1 - LIMIT_OFFSET_PCT)
+    
+    log.info(f"Flatten with limit: {side} {size:.4f} BTC at ${limit_price:.2f} (market: ${current_price:.2f})")
+    
+    try:
+        api.send_order({
+            "orderType": "lmt",
+            "symbol": SYMBOL_FUTS_LC,
+            "side": side,
+            "size": round(size, 4),
+            "limitPrice": int(round(limit_price)),
+        })
+    except Exception as e:
+        log.warning(f"Flatten limit order failed: {e}")
+
+
+def flatten_position_market(api: kf.KrakenFuturesApi):
+    """Flatten any remaining position with market order"""
+    pos = get_current_position(api)
+    if not pos:
+        log.info("No remaining position to flatten")
+        return
+    
+    side = "sell" if pos["side"] == "long" else "buy"
+    size = pos["size_btc"]
+    
+    log.info(f"Flatten remaining with market: {side} {size:.4f} BTC")
+    
+    try:
+        api.send_order({
+            "orderType": "mkt",
+            "symbol": SYMBOL_FUTS_LC,
+            "side": side,
+            "size": round(size, 4),
+        })
+    except Exception as e:
+        log.warning(f"Flatten market order failed: {e}")
+
+
+def place_entry_limit(api: kf.KrakenFuturesApi, side: str, size_btc: float, current_price: float) -> float:
+    """Place entry limit order (0.02% in favorable direction)"""
+    # Calculate limit price: favorable direction + 0.02%
+    if side == "buy":
+        # Buying: place limit below market
+        limit_price = current_price * (1 - LIMIT_OFFSET_PCT)
+    else:
+        # Selling: place limit above market
+        limit_price = current_price * (1 + LIMIT_OFFSET_PCT)
+    
+    log.info(f"Entry limit: {side} {size_btc:.4f} BTC at ${limit_price:.2f} (market: ${current_price:.2f})")
+    
+    try:
+        ord = api.send_order({
+            "orderType": "lmt",
+            "symbol": SYMBOL_FUTS_LC,
+            "side": side,
+            "size": round(size_btc, 4),
+            "limitPrice": int(round(limit_price)),
+        })
+        return limit_price
+    except Exception as e:
+        log.error(f"Entry limit order failed: {e}")
+        return current_price
+
+
+def place_entry_market_remaining(api: kf.KrakenFuturesApi, side: str, intended_size: float) -> float:
+    """Place market order for any remaining unfilled amount"""
+    pos = get_current_position(api)
+    
+    if pos and pos["side"] == ("long" if side == "buy" else "short"):
+        filled_size = pos["size_btc"]
+        log.info(f"Limit order filled {filled_size:.4f} BTC of {intended_size:.4f} BTC")
+        
+        remaining = intended_size - filled_size
+        if remaining > 0.0001:  # Only if significant remaining
+            log.info(f"Entry market for remaining: {side} {remaining:.4f} BTC")
+            try:
+                api.send_order({
+                    "orderType": "mkt",
+                    "symbol": SYMBOL_FUTS_LC,
+                    "side": side,
+                    "size": round(remaining, 4),
+                })
+            except Exception as e:
+                log.warning(f"Entry market order failed: {e}")
+        else:
+            log.info("Limit order fully filled, no market order needed")
+        
+        # Get final position
+        final_pos = get_current_position(api)
+        if final_pos:
+            return final_pos["fill_price"]
+    else:
+        log.warning("No position found after limit order, placing full market order")
+        try:
+            ord = api.send_order({
+                "orderType": "mkt",
+                "symbol": SYMBOL_FUTS_LC,
+                "side": side,
+                "size": round(intended_size, 4),
+            })
+            return float(ord.get("price", 0))
+        except Exception as e:
+            log.error(f"Full market order failed: {e}")
+            return 0
+    
+    return 0
+
+
+def place_stop(api: kf.KrakenFuturesApi, side: str, size_btc: float, fill_price: float):
+    """Place 5% static stop loss"""
+    stop_distance = fill_price * STATIC_STOP_PCT
+    
+    if side == "buy":
+        stop_price = fill_price - stop_distance
+        stop_side = "sell"
+        limit_price = stop_price * 0.9999
+    else:
+        stop_price = fill_price + stop_distance
+        stop_side = "buy"
+        limit_price = stop_price * 1.0001
+    
+    log.info(f"Placing 5% static stop: {stop_side} at ${stop_price:.2f} (distance: ${stop_distance:.2f})")
+    
+    try:
+        api.send_order({
+            "orderType": "stp",
+            "symbol": SYMBOL_FUTS_LC,
+            "side": stop_side,
+            "size": round(size_btc, 4),
+            "stopPrice": int(round(stop_price)),
+            "limitPrice": int(round(limit_price)),
+        })
+    except Exception as e:
+        log.error(f"Stop loss order failed: {e}")
 
 
 def smoke_test(api: kf.KrakenFuturesApi):
@@ -278,9 +392,10 @@ def update_state_with_current_position(api: kf.KrakenFuturesApi):
         state["strategy_info"] = {
             "sma_period_long": SMA_PERIOD_LONG,
             "sma_period_short": SMA_PERIOD_SHORT,
-            "atr_period": ATR_PERIOD,
-            "atr_multiplier": ATR_MULTIPLIER,
+            "stop_loss_pct": STATIC_STOP_PCT * 100,
             "leverage": LEV,
+            "order_type": "limit",
+            "limit_offset_pct": LIMIT_OFFSET_PCT * 100,
             "last_updated": datetime.now(timezone.utc).isoformat()
         }
     
@@ -309,10 +424,21 @@ def daily_trade(api: kf.KrakenFuturesApi):
     # Generate signal
     signal, sma_365, sma_120, atr = generate_signal(df, current_price)
     
-    # Close existing position
-    log.info("Closing any existing positions...")
+    # === STEP 1: Flatten with limit order ===
+    log.info("=== STEP 1: Flatten with limit order ===")
+    flatten_position_limit(api, current_price)
+    
+    # === STEP 2: Sleep 600 seconds ===
+    log.info("=== STEP 2: Sleeping 600 seconds ===")
+    time.sleep(600)
+    
+    # === STEP 3: Flatten remaining with market order ===
+    log.info("=== STEP 3: Flatten remaining with market order ===")
+    flatten_position_market(api)
+    
+    # === STEP 4: Cancel all orders ===
+    log.info("=== STEP 4: Cancel all orders ===")
     cancel_all(api)
-    flatten_position(api)
     time.sleep(2)
     
     # Get fresh portfolio value after flatten
@@ -347,24 +473,45 @@ def daily_trade(api: kf.KrakenFuturesApi):
         
         side = "buy" if signal == "LONG" else "sell"
         
-        log.info(f"Opening {signal} position: {side} {size_btc} BTC at ~${current_price:.2f}")
+        log.info(f"Opening {signal} position: {size_btc} BTC")
         
         if dry:
             log.info(f"DRY-RUN: {signal} {size_btc} BTC at ${current_price:.2f}")
             fill_price = current_price
         else:
-            ord = api.send_order({
-                "orderType": "mkt",
-                "symbol": SYMBOL_FUTS_LC,
-                "side": side,
-                "size": size_btc,
-            })
-            fill_price = float(ord.get("price", current_price))
+            # === STEP 5: Place entry limit order ===
+            log.info("=== STEP 5: Place entry limit order ===")
+            limit_price = place_entry_limit(api, side, size_btc, current_price)
             
-            # Place ATR-based stop loss
-            place_stop(api, side, size_btc, fill_price, atr)
+            # === STEP 6: Sleep 600 seconds ===
+            log.info("=== STEP 6: Sleeping 600 seconds ===")
+            time.sleep(600)
+            
+            # === STEP 7: Place entry market for remaining ===
+            log.info("=== STEP 7: Place entry market for remaining ===")
+            fill_price = place_entry_market_remaining(api, side, size_btc)
+            
+            # === STEP 8: Cancel all orders ===
+            log.info("=== STEP 8: Cancel all orders ===")
+            cancel_all(api)
+            time.sleep(2)
+            
+            # Get final position info
+            final_pos = get_current_position(api)
+            if final_pos:
+                fill_price = final_pos["fill_price"]
+                size_btc = final_pos["size_btc"]
+                log.info(f"Final position: {size_btc:.4f} BTC @ ${fill_price:.2f}")
+            else:
+                log.error("No position found after entry orders!")
+                fill_price = current_price
+            
+            # === STEP 9: Place stop loss ===
+            log.info("=== STEP 9: Place stop loss ===")
+            place_stop(api, side, size_btc, fill_price)
         
         # Record trade
+        stop_distance = fill_price * STATIC_STOP_PCT
         trade_record = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "signal": signal,
@@ -375,7 +522,8 @@ def daily_trade(api: kf.KrakenFuturesApi):
             "sma_365": sma_365,
             "sma_120": sma_120,
             "atr": atr,
-            "stop_distance": ATR_MULTIPLIER * atr,
+            "stop_distance": stop_distance,
+            "stop_loss_pct": STATIC_STOP_PCT * 100,
         }
         
         state["trades"].append(trade_record)
@@ -394,9 +542,10 @@ def daily_trade(api: kf.KrakenFuturesApi):
     state["strategy_info"] = {
         "sma_period_long": SMA_PERIOD_LONG,
         "sma_period_short": SMA_PERIOD_SHORT,
-        "atr_period": ATR_PERIOD,
-        "atr_multiplier": ATR_MULTIPLIER,
+        "stop_loss_pct": STATIC_STOP_PCT * 100,
         "leverage": LEV,
+        "order_type": "limit",
+        "limit_offset_pct": LIMIT_OFFSET_PCT * 100,
         "last_updated": datetime.now(timezone.utc).isoformat()
     }
     
