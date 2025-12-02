@@ -30,8 +30,8 @@ INTERVAL_KRAKEN = 1440
 SMA_PERIOD_LONG = 365
 SMA_PERIOD_SHORT = 120
 ATR_PERIOD = 14
-ATR_MULTIPLIER = 3.2
-LEV = 1.5
+STATIC_STOP_PCT = 5.0  # 5% static stop
+LEV = 4  # 4x leverage
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -76,8 +76,7 @@ class DashboardMonitor:
             "strategy_info": {
                 "sma_period_long": SMA_PERIOD_LONG,
                 "sma_period_short": SMA_PERIOD_SHORT,
-                "atr_period": ATR_PERIOD,
-                "atr_multiplier": ATR_MULTIPLIER,
+                "stop_loss_pct": STATIC_STOP_PCT,
                 "leverage": LEV
             },
             "last_updated": None
@@ -266,7 +265,8 @@ class DashboardMonitor:
                 "sma_365": self.state["market_data"].get("sma_365", 0),
                 "sma_120": self.state["market_data"].get("sma_120", 0),
                 "atr": self.state["market_data"].get("atr", 0),
-                "stop_distance": ATR_MULTIPLIER * self.state["market_data"].get("atr", 0)
+                "stop_distance": (current_position["fill_price"] * (STATIC_STOP_PCT / 100)) if current_position else 0,
+                "stop_loss_pct": STATIC_STOP_PCT
             }
             
             self.state["trades"].append(trade_record)
@@ -506,7 +506,7 @@ HTML_TEMPLATE = """
         <h1>SMA 365 + 120 Trading Dashboard</h1>
         <div class="subtitle">
             <span class="status-indicator {% if data_fresh %}status-live{% else %}status-offline{% endif %}"></span>
-            Dual SMA Strategy (365/120) with ATR Stop Loss | Independent Monitor
+            Dual SMA Strategy (365/120) with 5% Static Stop | 4x Leverage | Limit Orders
         </div>
         
         {% if not api_configured %}
@@ -576,16 +576,16 @@ HTML_TEMPLATE = """
                     <div class="strategy-stat-value">{{ sma_period_short }} days</div>
                 </div>
                 <div class="strategy-stat">
-                    <div class="strategy-stat-label">ATR Period</div>
-                    <div class="strategy-stat-value">{{ atr_period }} days</div>
-                </div>
-                <div class="strategy-stat">
-                    <div class="strategy-stat-label">ATR Multiplier</div>
-                    <div class="strategy-stat-value">{{ atr_multiplier }}x</div>
+                    <div class="strategy-stat-label">Stop Loss</div>
+                    <div class="strategy-stat-value">{{ stop_loss_pct }}% Static</div>
                 </div>
                 <div class="strategy-stat">
                     <div class="strategy-stat-label">Leverage</div>
                     <div class="strategy-stat-value">{{ leverage }}x</div>
+                </div>
+                <div class="strategy-stat">
+                    <div class="strategy-stat-label">Order Type</div>
+                    <div class="strategy-stat-value">Limit (0.02%)</div>
                 </div>
             </div>
         </div>
@@ -604,7 +604,7 @@ HTML_TEMPLATE = """
                         <th>Fill Price</th>
                         <th>SMA 365</th>
                         <th>SMA 120</th>
-                        <th>ATR</th>
+                        <th>Stop %</th>
                         <th>Stop Distance</th>
                         <th>Portfolio Value</th>
                     </tr>
@@ -619,7 +619,7 @@ HTML_TEMPLATE = """
                         <td>${{ trade.fill_price }}</td>
                         <td>${{ trade.sma_365 }}</td>
                         <td>${{ trade.sma_120 }}</td>
-                        <td>${{ trade.atr }}</td>
+                        <td>{{ trade.stop_loss_pct }}%</td>
                         <td>${{ trade.stop_distance }}</td>
                         <td>${{ trade.portfolio_value }}</td>
                     </tr>
@@ -692,9 +692,8 @@ def dashboard():
     strategy_info = state.get("strategy_info", {})
     sma_period_long = strategy_info.get('sma_period_long', 365)
     sma_period_short = strategy_info.get('sma_period_short', 120)
-    atr_period = strategy_info.get('atr_period', 14)
-    atr_multiplier = strategy_info.get('atr_multiplier', 3.2)
-    leverage = strategy_info.get('leverage', 1.5)
+    stop_loss_pct = strategy_info.get('stop_loss_pct', 5.0)
+    leverage = strategy_info.get('leverage', 4)
     
     # Format trades
     trades = []
@@ -710,8 +709,8 @@ def dashboard():
         trade_copy['portfolio_value'] = f"{trade.get('portfolio_value', 0):.2f}"
         trade_copy['sma_365'] = f"{trade.get('sma_365', 0):.2f}"
         trade_copy['sma_120'] = f"{trade.get('sma_120', 0):.2f}"
-        trade_copy['atr'] = f"{trade.get('atr', 0):.2f}"
         trade_copy['stop_distance'] = f"{trade.get('stop_distance', 0):.2f}"
+        trade_copy['stop_loss_pct'] = f"{trade.get('stop_loss_pct', 5.0):.1f}"
         trades.append(trade_copy)
     
     # Reverse for display (newest first)
@@ -735,8 +734,7 @@ def dashboard():
         market_signal=market_signal,
         sma_period_long=sma_period_long,
         sma_period_short=sma_period_short,
-        atr_period=atr_period,
-        atr_multiplier=atr_multiplier,
+        stop_loss_pct=stop_loss_pct,
         leverage=leverage,
         trades=trades,
         last_updated=state.get("last_updated", "Never").replace('T', ' ').replace('Z', '')
