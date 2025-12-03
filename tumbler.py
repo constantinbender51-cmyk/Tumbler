@@ -240,8 +240,9 @@ def place_entry_limit(api: kf.KrakenFuturesApi, side: str, size_btc: float, curr
         return current_price
 
 
-def place_entry_market_remaining(api: kf.KrakenFuturesApi, side: str, intended_size: float) -> float:
-    """Place market order for any remaining unfilled amount"""
+def place_entry_market_remaining(api: kf.KrakenFuturesApi, side: str, intended_size: float, limit_price: float, current_price: float) -> Tuple[float, float]:
+    """Place market order for any remaining unfilled amount
+    Returns: (final_fill_price, final_size)"""
     pos = get_current_position(api)
     
     if pos and pos["side"] == ("long" if side == "buy" else "short"):
@@ -258,30 +259,34 @@ def place_entry_market_remaining(api: kf.KrakenFuturesApi, side: str, intended_s
                     "side": side,
                     "size": round(remaining, 4),
                 })
+                # After market order, assume average fill between limit and current
+                fill_price = (limit_price * filled_size + current_price * remaining) / intended_size
+                log.info(f"Estimated average fill price: ${fill_price:.2f}")
+                return fill_price, intended_size
             except Exception as e:
                 log.warning(f"Entry market order failed: {e}")
+                # If market order failed, use limit price for filled amount
+                return limit_price, filled_size
         else:
             log.info("Limit order fully filled, no market order needed")
-        
-        # Get final position
-        final_pos = get_current_position(api)
-        if final_pos:
-            return final_pos["fill_price"]
+            # All filled at limit price
+            return limit_price, filled_size
     else:
         log.warning("No position found after limit order, placing full market order")
         try:
-            ord = api.send_order({
+            api.send_order({
                 "orderType": "mkt",
                 "symbol": SYMBOL_FUTS_LC,
                 "side": side,
                 "size": round(intended_size, 4),
             })
-            return float(ord.get("price", 0))
+            # Market order, use current price
+            return current_price, intended_size
         except Exception as e:
             log.error(f"Full market order failed: {e}")
-            return 0
+            return current_price, 0
     
-    return 0
+    return current_price, 0
 
 
 def place_stop(api: kf.KrakenFuturesApi, side: str, size_btc: float, fill_price: float):
@@ -478,6 +483,7 @@ def daily_trade(api: kf.KrakenFuturesApi):
         if dry:
             log.info(f"DRY-RUN: {signal} {size_btc} BTC at ${current_price:.2f}")
             fill_price = current_price
+            final_size = size_btc
         else:
             # === STEP 5: Place entry limit order ===
             log.info("=== STEP 5: Place entry limit order ===")
@@ -489,26 +495,18 @@ def daily_trade(api: kf.KrakenFuturesApi):
             
             # === STEP 7: Place entry market for remaining ===
             log.info("=== STEP 7: Place entry market for remaining ===")
-            fill_price = place_entry_market_remaining(api, side, size_btc)
+            fill_price, final_size = place_entry_market_remaining(api, side, size_btc, limit_price, current_price)
             
             # === STEP 8: Cancel all orders ===
             log.info("=== STEP 8: Cancel all orders ===")
             cancel_all(api)
             time.sleep(2)
             
-            # Get final position info
-            final_pos = get_current_position(api)
-            if final_pos:
-                fill_price = final_pos["fill_price"]
-                size_btc = final_pos["size_btc"]
-                log.info(f"Final position: {size_btc:.4f} BTC @ ${fill_price:.2f}")
-            else:
-                log.error("No position found after entry orders!")
-                fill_price = current_price
+            log.info(f"Final position: {final_size:.4f} BTC @ ${fill_price:.2f}")
             
             # === STEP 9: Place stop loss ===
             log.info("=== STEP 9: Place stop loss ===")
-            place_stop(api, side, size_btc, fill_price)
+            place_stop(api, side, final_size, fill_price)
         
         # Record trade
         stop_distance = fill_price * STATIC_STOP_PCT
@@ -516,7 +514,7 @@ def daily_trade(api: kf.KrakenFuturesApi):
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "signal": signal,
             "side": side,
-            "size_btc": size_btc,
+            "size_btc": final_size if not dry else size_btc,
             "fill_price": fill_price,
             "portfolio_value": collateral,
             "sma_365": sma_365,
