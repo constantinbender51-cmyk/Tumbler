@@ -30,8 +30,8 @@ INTERVAL_KRAKEN = 1440
 SMA_PERIOD_LONG = 365
 SMA_PERIOD_SHORT = 120
 ATR_PERIOD = 14
-STATIC_STOP_PCT = 5.0  # 5% static stop
-LEV = 4  # 4x leverage
+STATIC_STOP_PCT = 3.0  # 3% static stop
+LEV = 2.5  # 2.5x leverage
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -508,7 +508,7 @@ HTML_TEMPLATE = """
         <h1>SMA 365 + 120 Trading Dashboard</h1>
         <div class="subtitle">
             <span class="status-indicator {% if data_fresh %}status-live{% else %}status-offline{% endif %}"></span>
-            Dual SMA Strategy (365/120) with 5% Static Stop | 4x Leverage | Limit Orders
+            Dual SMA Strategy (365/120) with 3% Static Stop | 2.5x Leverage | Limit Orders
         </div>
         
         {% if not api_configured %}
