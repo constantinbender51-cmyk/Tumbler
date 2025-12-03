@@ -33,11 +33,11 @@ SYMBOL_OHLC_KRAKEN = "XBTUSD"
 SYMBOL_OHLC_BINANCE = "BTCUSDT"
 INTERVAL_KRAKEN = 1440
 INTERVAL_BINANCE = "1d"
-SMA_PERIOD_LONG = 365  # Primary trend indicator
+SMA_PERIOD_LONG = 40  # Primary trend indicator
 SMA_PERIOD_SHORT = 120  # Trend filter
 ATR_PERIOD = 14
-STATIC_STOP_PCT = 0.03  # 3% static stop loss
-LEV = 2.5  # 2.5x leverage
+STATIC_STOP_PCT = 0.02  # 2% static stop loss
+LEV = 3.5  # 3.5x leverage
 LIMIT_OFFSET_PCT = 0.0002  # 0.02% offset for limit orders
 STOP_WAIT_TIME = 600  # Wait 10 minutes before placing stop loss
 STATE_FILE = Path("sma_state.json")
@@ -51,11 +51,11 @@ log = logging.getLogger("sma_strategy")
 
 
 def calculate_sma_and_atr(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculate 365-day SMA, 120-day SMA, and 14-day ATR"""
+    """Calculate 40-day SMA, 120-day SMA, and 14-day ATR"""
     df = df.copy()
     
     # Calculate SMAs
-    df['sma_365'] = df['close'].rolling(window=SMA_PERIOD_LONG).mean()
+    df['sma_40'] = df['close'].rolling(window=SMA_PERIOD_LONG).mean()
     df['sma_120'] = df['close'].rolling(window=SMA_PERIOD_SHORT).mean()
     
     # Calculate True Range
@@ -75,50 +75,50 @@ def calculate_sma_and_atr(df: pd.DataFrame) -> pd.DataFrame:
 
 def generate_signal(df: pd.DataFrame, current_price: float) -> Tuple[str, float, float, float]:
     """
-    Generate trading signal based on SMA 365 with SMA 120 filter
-    Returns: (signal, sma_365, sma_120, atr)
+    Generate trading signal based on SMA 40 with SMA 120 filter
+    Returns: (signal, sma_40, sma_120, atr)
     
     Logic:
-    - LONG: price > SMA 365 AND price > SMA 120
-    - SHORT: price < SMA 365 AND price < SMA 120
+    - LONG: price > SMA 40 AND price > SMA 120
+    - SHORT: price < SMA 40 AND price < SMA 120
     - FLAT: otherwise (contradictory signals)
     """
     df_calc = calculate_sma_and_atr(df)
     
     # Get latest values
-    sma_365 = df_calc['sma_365'].iloc[-1]
+    sma_40 = df_calc['sma_40'].iloc[-1]
     sma_120 = df_calc['sma_120'].iloc[-1]
     atr = df_calc['atr'].iloc[-1]
     
     # Check if we have valid values
-    if pd.isna(sma_365) or pd.isna(sma_120) or pd.isna(atr):
-        raise ValueError("Not enough historical data for SMA 365, SMA 120, or ATR calculation")
+    if pd.isna(sma_40) or pd.isna(sma_120) or pd.isna(atr):
+        raise ValueError("Not enough historical data for SMA 40, SMA 120, or ATR calculation")
     
     # Generate signal with 120 SMA filter
     signal = "FLAT"
     
-    if current_price > sma_365:
+    if current_price > sma_40:
         # Primary signal is LONG
         if current_price > sma_120:
             signal = "LONG"  # Both conditions met
         else:
-            signal = "FLAT"  # Price above 365 SMA but below 120 SMA - stay out
+            signal = "FLAT"  # Price above 40 SMA but below 120 SMA - stay out
             log.info("LONG signal filtered out: price below SMA 120")
     else:
         # Primary signal is SHORT
         if current_price < sma_120:
             signal = "SHORT"  # Both conditions met
         else:
-            signal = "FLAT"  # Price below 365 SMA but above 120 SMA - stay out
+            signal = "FLAT"  # Price below 40 SMA but above 120 SMA - stay out
             log.info("SHORT signal filtered out: price above SMA 120")
     
     log.info(f"Current price: ${current_price:.2f}")
-    log.info(f"SMA 365: ${sma_365:.2f}")
+    log.info(f"SMA 40: ${sma_40:.2f}")
     log.info(f"SMA 120: ${sma_120:.2f}")
     log.info(f"ATR (14-day): ${atr:.2f}")
     log.info(f"Signal: {signal}")
     
-    return signal, sma_365, sma_120, atr
+    return signal, sma_40, sma_120, atr
 
 
 def portfolio_usd(api: kf.KrakenFuturesApi) -> float:
@@ -420,7 +420,7 @@ def daily_trade(api: kf.KrakenFuturesApi):
         state["starting_capital"] = portfolio_value
     
     # Generate signal
-    signal, sma_365, sma_120, atr = generate_signal(df, current_price)
+    signal, sma_40, sma_120, atr = generate_signal(df, current_price)
     
     # === STEP 1: Flatten with limit order ===
     log.info("=== STEP 1: Flatten with limit order ===")
@@ -454,7 +454,7 @@ def daily_trade(api: kf.KrakenFuturesApi):
             "size_btc": 0,
             "fill_price": current_price,
             "portfolio_value": collateral,
-            "sma_365": sma_365,
+            "sma_40": sma_40,
             "sma_120": sma_120,
             "atr": atr,
             "stop_distance": 0,
