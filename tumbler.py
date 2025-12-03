@@ -326,7 +326,7 @@ def smoke_test(api: kf.KrakenFuturesApi):
         # Check open positions
         current_pos = get_current_position(api)
         if current_pos:
-            log.info(f"Open position: {current_pos['signal']} {current_pos['size_btc']:.4f} BTC @ ${current_pos['fill_price']:.2f}")
+            log.info(f"Open position: {current_pos['signal']} {current_pos['size_btc']:.4f} BTC")
         else:
             log.info("No open positions")
         
@@ -401,7 +401,7 @@ def update_state_with_current_position(api: kf.KrakenFuturesApi):
     log.info(f"Updated state with current position and portfolio value: ${portfolio_value:.2f}")
     
     if current_pos:
-        log.info(f"Current position: {current_pos['signal']} {current_pos['size_btc']:.4f} BTC @ ${current_pos['fill_price']:.2f}")
+        log.info(f"Current position: {current_pos['signal']} {current_pos['size_btc']:.4f} BTC")
     else:
         log.info("No current position")
 
@@ -476,7 +476,6 @@ def daily_trade(api: kf.KrakenFuturesApi):
         if dry:
             log.info(f"DRY-RUN: {signal} {size_btc} BTC at ${current_price:.2f}")
             fill_price = current_price
-            final_size = size_btc
         else:
             # === STEP 5: Place entry limit order ===
             log.info("=== STEP 5: Place entry limit order ===")
@@ -488,23 +487,26 @@ def daily_trade(api: kf.KrakenFuturesApi):
             
             # === STEP 7: Place entry market for remaining ===
             log.info("=== STEP 7: Place entry market for remaining ===")
-            # Get fresh current price after 10 minutes
-            current_price = mark_price(api)
-            final_size = place_entry_market_remaining(api, side, size_btc, current_price)
-            
-            # Use current price as fill price for simplicity
-            fill_price = current_price
+            fill_price = place_entry_market_remaining(api, side, size_btc)
             
             # === STEP 8: Cancel all orders ===
             log.info("=== STEP 8: Cancel all orders ===")
             cancel_all(api)
             time.sleep(2)
             
-            log.info(f"Final position: {final_size:.4f} BTC @ ${fill_price:.2f} (current market price)")
+            # Get final position info
+            final_pos = get_current_position(api)
+            if final_pos:
+                fill_price = final_pos["fill_price"]
+                size_btc = final_pos["size_btc"]
+                log.info(f"Final position: {size_btc:.4f} BTC @ ${fill_price:.2f}")
+            else:
+                log.error("No position found after entry orders!")
+                fill_price = current_price
             
             # === STEP 9: Place stop loss ===
             log.info("=== STEP 9: Place stop loss ===")
-            place_stop(api, side, final_size, fill_price)
+            place_stop(api, side, size_btc, fill_price)
         
         # Record trade
         stop_distance = fill_price * STATIC_STOP_PCT
@@ -512,7 +514,7 @@ def daily_trade(api: kf.KrakenFuturesApi):
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "signal": signal,
             "side": side,
-            "size_btc": final_size if not dry else size_btc,
+            "size_btc": size_btc,
             "fill_price": fill_price,
             "portfolio_value": collateral,
             "sma_365": sma_365,
