@@ -27,11 +27,11 @@ UPDATE_INTERVAL = 300  # 5 minutes
 SYMBOL_FUTS_UC = "PF_XBTUSD"
 SYMBOL_OHLC_KRAKEN = "XBTUSD"
 INTERVAL_KRAKEN = 1440
-SMA_PERIOD_LONG = 365
+SMA_PERIOD_LONG = 40
 SMA_PERIOD_SHORT = 120
 ATR_PERIOD = 14
-STATIC_STOP_PCT = 3.0  # 3% static stop
-LEV = 2.5  # 2.5x leverage
+STATIC_STOP_PCT = 2.0  # 2% static stop
+LEV = 3.5  # 3.5x leverage
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -155,14 +155,14 @@ class DashboardMonitor:
             return pd.DataFrame()
 
     def calculate_sma_and_atr(self, df: pd.DataFrame) -> tuple:
-        """Calculate SMA 365, SMA 120, and ATR values"""
-        if len(df) < SMA_PERIOD_LONG:
+        """Calculate SMA 40, SMA 120, and ATR values"""
+        if len(df) < SMA_PERIOD_SHORT:
             return 0, 0, 0
         
         df = df.copy()
         
         # Calculate SMAs
-        sma_365 = df['close'].rolling(window=SMA_PERIOD_LONG).mean().iloc[-1]
+        sma_40 = df['close'].rolling(window=SMA_PERIOD_LONG).mean().iloc[-1]
         sma_120 = df['close'].rolling(window=SMA_PERIOD_SHORT).mean().iloc[-1]
         
         # Calculate ATR
@@ -175,13 +175,13 @@ class DashboardMonitor:
         )
         atr = df['tr'].rolling(window=ATR_PERIOD).mean().iloc[-1]
         
-        return float(sma_365), float(sma_120), float(atr)
+        return float(sma_40), float(sma_120), float(atr)
 
-    def generate_signal(self, current_price: float, sma_365: float, sma_120: float) -> str:
+    def generate_signal(self, current_price: float, sma_40: float, sma_120: float) -> str:
         """Generate trading signal based on both SMAs"""
-        if current_price > sma_365 and current_price > sma_120:
+        if current_price > sma_40 and current_price > sma_120:
             return "LONG"
-        elif current_price < sma_365 and current_price < sma_120:
+        elif current_price < sma_40 and current_price < sma_120:
             return "SHORT"
         else:
             return "FLAT"
@@ -201,8 +201,8 @@ class DashboardMonitor:
             ohlc_data = self.get_ohlc_data()
             
             # Calculate technical indicators
-            sma_365, sma_120, atr = self.calculate_sma_and_atr(ohlc_data)
-            signal = self.generate_signal(mark_price, sma_365, sma_120)
+            sma_40, sma_120, atr = self.calculate_sma_and_atr(ohlc_data)
+            signal = self.generate_signal(mark_price, sma_40, sma_120)
             
             # Update performance metrics
             if self.state["performance"]["starting_capital"] == 0:
@@ -224,7 +224,7 @@ class DashboardMonitor:
             self.state["current_position"] = current_position
             self.state["market_data"] = {
                 "current_price": mark_price,
-                "sma_365": sma_365,
+                "sma_40": sma_40,
                 "sma_120": sma_120,
                 "atr": atr,
                 "signal": signal,
@@ -264,7 +264,7 @@ class DashboardMonitor:
                 "size_btc": current_position["size_btc"] if current_position else 0,
                 "fill_price": current_price,
                 "portfolio_value": self.state["performance"]["current_value"],
-                "sma_365": self.state["market_data"].get("sma_365", 0),
+                "sma_40": self.state["market_data"].get("sma_40", 0),
                 "sma_120": self.state["market_data"].get("sma_120", 0),
                 "atr": self.state["market_data"].get("atr", 0),
                 "stop_distance": (current_price * (STATIC_STOP_PCT / 100)) if current_position else 0,
@@ -290,7 +290,7 @@ HTML_TEMPLATE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="refresh" content="30">
-    <title>SMA 365 + 120 BTC Trading Dashboard</title>
+    <title>SMA 40 + 120 BTC Trading Dashboard</title>
     <style>
         * {
             margin: 0;
@@ -505,10 +505,10 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <div class="container">
-        <h1>SMA 365 + 120 Trading Dashboard</h1>
+        <h1>SMA 40 + 120 Trading Dashboard</h1>
         <div class="subtitle">
             <span class="status-indicator {% if data_fresh %}status-live{% else %}status-offline{% endif %}"></span>
-            Dual SMA Strategy (365/120) with 3% Static Stop | 2.5x Leverage | Limit Orders
+            Dual SMA Strategy (40/120) with 2% Static Stop | 3.5x Leverage | Limit Orders
         </div>
         
         {% if not api_configured %}
@@ -545,9 +545,9 @@ HTML_TEMPLATE = """
                 <div class="card-label">BTC Mark Price</div>
             </div>
             <div class="card">
-                <h2>SMA 365</h2>
-                <div class="card-value">${{ sma_365 }}</div>
-                <div class="card-label">365-day Moving Average</div>
+                <h2>SMA 40</h2>
+                <div class="card-value">${{ sma_40 }}</div>
+                <div class="card-label">40-day Moving Average</div>
             </div>
             <div class="card">
                 <h2>SMA 120</h2>
@@ -604,7 +604,7 @@ HTML_TEMPLATE = """
                         <th>Side</th>
                         <th>Size (BTC)</th>
                         <th>Fill Price</th>
-                        <th>SMA 365</th>
+                        <th>SMA 40</th>
                         <th>SMA 120</th>
                         <th>Stop %</th>
                         <th>Stop Distance</th>
@@ -619,7 +619,7 @@ HTML_TEMPLATE = """
                         <td class="{{ trade.signal.lower() }}">{{ trade.side.upper() }}</td>
                         <td>{{ trade.size_btc }}</td>
                         <td>${{ trade.fill_price }}</td>
-                        <td>${{ trade.sma_365 }}</td>
+                        <td>${{ trade.sma_40 }}</td>
                         <td>${{ trade.sma_120 }}</td>
                         <td>{{ trade.stop_loss_pct }}%</td>
                         <td>${{ trade.stop_distance }}</td>
@@ -687,7 +687,7 @@ def dashboard():
     
     # Market data
     market_price = f"{market_data.get('current_price', 0):.2f}"
-    sma_365 = f"{market_data.get('sma_365', 0):.2f}"
+    sma_40 = f"{market_data.get('sma_40', 0):.2f}"
     sma_120 = f"{market_data.get('sma_120', 0):.2f}"
     market_signal = market_data.get('signal', 'N/A')
     
@@ -710,10 +710,10 @@ def dashboard():
         trade_copy['size_btc'] = f"{trade.get('size_btc', 0):.4f}"
         trade_copy['fill_price'] = f"{trade.get('fill_price', 0):.2f}"
         trade_copy['portfolio_value'] = f"{trade.get('portfolio_value', 0):.2f}"
-        trade_copy['sma_365'] = f"{trade.get('sma_365', 0):.2f}"
+        trade_copy['sma_40'] = f"{trade.get('sma_40', 0):.2f}"
         trade_copy['sma_120'] = f"{trade.get('sma_120', 0):.2f}"
         trade_copy['stop_distance'] = f"{trade.get('stop_distance', 0):.2f}"
-        trade_copy['stop_loss_pct'] = f"{trade.get('stop_loss_pct', 5.0):.1f}"
+        trade_copy['stop_loss_pct'] = f"{trade.get('stop_loss_pct', 2.0):.1f}"
         trades.append(trade_copy)
     
     # Reverse for display (newest first)
@@ -732,7 +732,7 @@ def dashboard():
         total_return_raw=total_return_raw,
         total_trades=total_trades,
         market_price=market_price,
-        sma_365=sma_365,
+        sma_40=sma_40,
         sma_120=sma_120,
         market_signal=market_signal,
         sma_period_long=sma_period_long,
