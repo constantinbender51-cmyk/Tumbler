@@ -118,17 +118,10 @@ class DashboardMonitor:
             positions = self.api.get_open_positions()
             for position in positions.get("openPositions", []):
                 if position["symbol"] == SYMBOL_FUTS_UC:
-                    size_btc = abs(float(position["size"]))
-                    cost = abs(float(position.get("cost", 0)))
-                    
-                    # Calculate fill price from cost
-                    fill_price = cost / size_btc if size_btc > 0 else 0
-                    
                     return {
                         "signal": "LONG" if position["side"] == "long" else "SHORT",
                         "side": position["side"],
-                        "size_btc": size_btc,
-                        "fill_price": fill_price,
+                        "size_btc": abs(float(position["size"])),
                         "unrealized_pnl": float(position.get("unrealizedFunding", 0))
                     }
             return None
@@ -261,17 +254,20 @@ class DashboardMonitor:
             (old_position["size_btc"] != current_position["size_btc"] or 
              old_position["side"] != current_position["side"])):
             
+            # Use current market price
+            current_price = self.state["market_data"].get("current_price", 0)
+            
             trade_record = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "signal": current_position["signal"] if current_position else "FLAT",
                 "side": current_position["side"] if current_position else "none",
                 "size_btc": current_position["size_btc"] if current_position else 0,
-                "fill_price": current_position["fill_price"] if current_position else 0,
+                "fill_price": current_price,
                 "portfolio_value": self.state["performance"]["current_value"],
                 "sma_365": self.state["market_data"].get("sma_365", 0),
                 "sma_120": self.state["market_data"].get("sma_120", 0),
                 "atr": self.state["market_data"].get("atr", 0),
-                "stop_distance": (current_position["fill_price"] * (STATIC_STOP_PCT / 100)) if current_position else 0,
+                "stop_distance": (current_price * (STATIC_STOP_PCT / 100)) if current_position else 0,
                 "stop_loss_pct": STATIC_STOP_PCT
             }
             
@@ -672,12 +668,14 @@ def dashboard():
     current_position = state.get("current_position")
     current_signal = "FLAT"
     current_size = "0.0000"
-    current_price = "0.00"
+    
+    # Use current market price for display
+    market_data = state.get("market_data", {})
+    current_price = f"{market_data.get('current_price', 0):.2f}"
     
     if current_position:
         current_signal = current_position["signal"]
         current_size = f"{current_position['size_btc']:.4f}"
-        current_price = f"{current_position['fill_price']:.2f}"
     
     # Performance metrics
     performance = state.get("performance", {})
@@ -688,7 +686,6 @@ def dashboard():
     total_trades = performance.get('total_trades', 0)
     
     # Market data
-    market_data = state.get("market_data", {})
     market_price = f"{market_data.get('current_price', 0):.2f}"
     sma_365 = f"{market_data.get('sma_365', 0):.2f}"
     sma_120 = f"{market_data.get('sma_120', 0):.2f}"
