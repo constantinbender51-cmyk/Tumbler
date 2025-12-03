@@ -118,11 +118,17 @@ class DashboardMonitor:
             positions = self.api.get_open_positions()
             for position in positions.get("openPositions", []):
                 if position["symbol"] == SYMBOL_FUTS_UC:
+                    size_btc = abs(float(position["size"]))
+                    cost = abs(float(position.get("cost", 0)))
+                    
+                    # Calculate fill price from cost
+                    fill_price = cost / size_btc if size_btc > 0 else 0
+                    
                     return {
                         "signal": "LONG" if position["side"] == "long" else "SHORT",
                         "side": position["side"],
-                        "size_btc": abs(float(position["size"])),
-                        "fill_price": float(position.get("fillPrice", 0)),
+                        "size_btc": size_btc,
+                        "fill_price": fill_price,
                         "unrealized_pnl": float(position.get("unrealizedFunding", 0))
                     }
             return None
