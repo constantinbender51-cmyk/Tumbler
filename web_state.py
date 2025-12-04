@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-web_state.py - Independent SMA 365 + 120 Trading Dashboard
-Fetches data directly from Kraken API and maintains own state file
+web_state.py - Dual SMA Strategy Dashboard with State Machine
+Displays strategy with SMA 1 (57), SMA 2 (124), and cross flag state
 """
 
 from flask import Flask, render_template_string
@@ -27,11 +27,11 @@ UPDATE_INTERVAL = 300  # 5 minutes
 SYMBOL_FUTS_UC = "PF_XBTUSD"
 SYMBOL_OHLC_KRAKEN = "XBTUSD"
 INTERVAL_KRAKEN = 1440
-SMA_PERIOD_LONG = 40
-SMA_PERIOD_SHORT = 120
-ATR_PERIOD = 14
+SMA_PERIOD_1 = 57
+SMA_PERIOD_2 = 124
+BAND_WIDTH = 5.0  # 5% bands
 STATIC_STOP_PCT = 2.0  # 2% static stop
-LEV = 3.5  # 3.5x leverage
+LEV = 3  # 3x leverage
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -74,11 +74,13 @@ class DashboardMonitor:
             "current_position": None,
             "market_data": {},
             "strategy_info": {
-                "sma_period_long": SMA_PERIOD_LONG,
-                "sma_period_short": SMA_PERIOD_SHORT,
+                "sma_period_1": SMA_PERIOD_1,
+                "sma_period_2": SMA_PERIOD_2,
+                "band_width_pct": BAND_WIDTH,
                 "stop_loss_pct": STATIC_STOP_PCT,
                 "leverage": LEV
             },
+            "cross_flag": 0,
             "last_updated": None
         }
 
@@ -154,37 +156,42 @@ class DashboardMonitor:
             log.error(f"Error getting OHLC data: {e}")
             return pd.DataFrame()
 
-    def calculate_sma_and_atr(self, df: pd.DataFrame) -> tuple:
-        """Calculate SMA 40, SMA 120, and ATR values"""
-        if len(df) < SMA_PERIOD_SHORT:
-            return 0, 0, 0
+    def calculate_smas(self, df: pd.DataFrame) -> tuple:
+        """Calculate SMA 1 (57) and SMA 2 (124)"""
+        if len(df) < SMA_PERIOD_2:
+            return 0, 0
         
         df = df.copy()
+        sma_1 = df['close'].rolling(window=SMA_PERIOD_1).mean().iloc[-1]
+        sma_2 = df['close'].rolling(window=SMA_PERIOD_2).mean().iloc[-1]
         
-        # Calculate SMAs
-        sma_40 = df['close'].rolling(window=SMA_PERIOD_LONG).mean().iloc[-1]
-        sma_120 = df['close'].rolling(window=SMA_PERIOD_SHORT).mean().iloc[-1]
-        
-        # Calculate ATR
-        df['tr'] = np.maximum(
-            df['high'] - df['low'],
-            np.maximum(
-                abs(df['high'] - df['close'].shift(1)),
-                abs(df['low'] - df['close'].shift(1))
-            )
-        )
-        atr = df['tr'].rolling(window=ATR_PERIOD).mean().iloc[-1]
-        
-        return float(sma_40), float(sma_120), float(atr)
+        return float(sma_1), float(sma_2)
 
-    def generate_signal(self, current_price: float, sma_40: float, sma_120: float) -> str:
-        """Generate trading signal based on both SMAs"""
-        if current_price > sma_40 and current_price > sma_120:
-            return "LONG"
-        elif current_price < sma_40 and current_price < sma_120:
-            return "SHORT"
-        else:
-            return "FLAT"
+    def generate_signal(self, current_price: float, sma_1: float, sma_2: float, cross_flag: int) -> str:
+        """Generate trading signal based on dual SMA with state machine"""
+        upper_band = sma_1 * (1 + BAND_WIDTH / 100)
+        lower_band = sma_1 * (1 - BAND_WIDTH / 100)
+        
+        signal = "FLAT"
+        
+        # LONG conditions
+        if current_price > upper_band:
+            signal = "LONG"
+        elif current_price > sma_1 and cross_flag == 1:
+            signal = "LONG"
+        # SHORT conditions
+        elif current_price < lower_band:
+            signal = "SHORT"
+        elif current_price < sma_1 and cross_flag == -1:
+            signal = "SHORT"
+        
+        # Apply SMA 2 filter
+        if signal == "LONG" and current_price < sma_2:
+            signal = "FLAT"
+        elif signal == "SHORT" and current_price > sma_2:
+            signal = "FLAT"
+        
+        return signal
 
     def update_data(self):
         """Update all dashboard data"""
@@ -201,8 +208,13 @@ class DashboardMonitor:
             ohlc_data = self.get_ohlc_data()
             
             # Calculate technical indicators
-            sma_40, sma_120, atr = self.calculate_sma_and_atr(ohlc_data)
-            signal = self.generate_signal(mark_price, sma_40, sma_120)
+            sma_1, sma_2 = self.calculate_smas(ohlc_data)
+            cross_flag = self.state.get("cross_flag", 0)
+            signal = self.generate_signal(mark_price, sma_1, sma_2, cross_flag)
+            
+            # Calculate bands
+            upper_band = sma_1 * (1 + BAND_WIDTH / 100)
+            lower_band = sma_1 * (1 - BAND_WIDTH / 100)
             
             # Update performance metrics
             if self.state["performance"]["starting_capital"] == 0:
@@ -224,9 +236,10 @@ class DashboardMonitor:
             self.state["current_position"] = current_position
             self.state["market_data"] = {
                 "current_price": mark_price,
-                "sma_40": sma_40,
-                "sma_120": sma_120,
-                "atr": atr,
+                "sma_1": sma_1,
+                "sma_2": sma_2,
+                "upper_band": upper_band,
+                "lower_band": lower_band,
                 "signal": signal,
                 "last_updated": datetime.now(timezone.utc).isoformat()
             }
@@ -264,9 +277,9 @@ class DashboardMonitor:
                 "size_btc": current_position["size_btc"] if current_position else 0,
                 "fill_price": current_price,
                 "portfolio_value": self.state["performance"]["current_value"],
-                "sma_40": self.state["market_data"].get("sma_40", 0),
-                "sma_120": self.state["market_data"].get("sma_120", 0),
-                "atr": self.state["market_data"].get("atr", 0),
+                "sma_1": self.state["market_data"].get("sma_1", 0),
+                "sma_2": self.state["market_data"].get("sma_2", 0),
+                "cross_flag": self.state.get("cross_flag", 0),
                 "stop_distance": (current_price * (STATIC_STOP_PCT / 100)) if current_position else 0,
                 "stop_loss_pct": STATIC_STOP_PCT
             }
@@ -290,7 +303,7 @@ HTML_TEMPLATE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="refresh" content="30">
-    <title>SMA 40 + 120 BTC Trading Dashboard</title>
+    <title>Dual SMA Trading Dashboard</title>
     <style>
         * {
             margin: 0;
@@ -501,14 +514,31 @@ HTML_TEMPLATE = """
         .status-offline {
             background: #ff0000;
         }
+        .cross-flag {
+            font-weight: 600;
+            padding: 2px 6px;
+            border-radius: 3px;
+        }
+        .cross-up {
+            background: #e8f5e9;
+            color: #2e7d32;
+        }
+        .cross-down {
+            background: #ffebee;
+            color: #c62828;
+        }
+        .cross-none {
+            background: #f5f5f5;
+            color: #757575;
+        }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>SMA 40 + 120 Trading Dashboard</h1>
+        <h1>Dual SMA State Machine Strategy</h1>
         <div class="subtitle">
             <span class="status-indicator {% if data_fresh %}status-live{% else %}status-offline{% endif %}"></span>
-            Dual SMA Strategy (40/120) with 2% Static Stop | 3.5x Leverage | Limit Orders
+            SMA1(57) + SMA2(124) with 5% Bands | 2% Stop | 3x Leverage
         </div>
         
         {% if not api_configured %}
@@ -545,19 +575,40 @@ HTML_TEMPLATE = """
                 <div class="card-label">BTC Mark Price</div>
             </div>
             <div class="card">
-                <h2>SMA 40</h2>
-                <div class="card-value">${{ sma_40 }}</div>
-                <div class="card-label">40-day Moving Average</div>
+                <h2>SMA 1 (Logic)</h2>
+                <div class="card-value">${{ sma_1 }}</div>
+                <div class="card-label">57-day MA with Bands</div>
             </div>
             <div class="card">
-                <h2>SMA 120</h2>
-                <div class="card-value">${{ sma_120 }}</div>
-                <div class="card-label">120-day Moving Average (Filter)</div>
+                <h2>SMA 2 (Filter)</h2>
+                <div class="card-value">${{ sma_2 }}</div>
+                <div class="card-label">124-day MA Filter</div>
+            </div>
+            <div class="card">
+                <h2>Cross State</h2>
+                <div class="card-value">
+                    <span class="cross-flag {{ cross_flag_class }}">{{ cross_flag_text }}</span>
+                </div>
+                <div class="card-label">State Machine Flag</div>
+            </div>
+        </div>
+
+        <!-- Bands Info -->
+        <div class="grid">
+            <div class="card">
+                <h2>Upper Band</h2>
+                <div class="card-value">${{ upper_band }}</div>
+                <div class="card-label">SMA1 + 5%</div>
+            </div>
+            <div class="card">
+                <h2>Lower Band</h2>
+                <div class="card-value">${{ lower_band }}</div>
+                <div class="card-label">SMA1 - 5%</div>
             </div>
             <div class="card">
                 <h2>Signal</h2>
                 <div class="card-value">{{ market_signal }}</div>
-                <div class="card-label">Price vs Both SMAs</div>
+                <div class="card-label">Current Strategy Signal</div>
             </div>
         </div>
 
@@ -570,24 +621,24 @@ HTML_TEMPLATE = """
                     <div class="strategy-stat-value">Dual SMA</div>
                 </div>
                 <div class="strategy-stat">
-                    <div class="strategy-stat-label">Long SMA</div>
-                    <div class="strategy-stat-value">{{ sma_period_long }} days</div>
+                    <div class="strategy-stat-label">SMA 1 (Logic)</div>
+                    <div class="strategy-stat-value">{{ sma_period_1 }} days</div>
                 </div>
                 <div class="strategy-stat">
-                    <div class="strategy-stat-label">Short SMA (Filter)</div>
-                    <div class="strategy-stat-value">{{ sma_period_short }} days</div>
+                    <div class="strategy-stat-label">SMA 2 (Filter)</div>
+                    <div class="strategy-stat-value">{{ sma_period_2 }} days</div>
+                </div>
+                <div class="strategy-stat">
+                    <div class="strategy-stat-label">Band Width</div>
+                    <div class="strategy-stat-value">{{ band_width_pct }}%</div>
                 </div>
                 <div class="strategy-stat">
                     <div class="strategy-stat-label">Stop Loss</div>
-                    <div class="strategy-stat-value">{{ stop_loss_pct }}% Static</div>
+                    <div class="strategy-stat-value">{{ stop_loss_pct }}%</div>
                 </div>
                 <div class="strategy-stat">
                     <div class="strategy-stat-label">Leverage</div>
                     <div class="strategy-stat-value">{{ leverage }}x</div>
-                </div>
-                <div class="strategy-stat">
-                    <div class="strategy-stat-label">Order Type</div>
-                    <div class="strategy-stat-value">Limit (0.02%)</div>
                 </div>
             </div>
         </div>
@@ -604,10 +655,10 @@ HTML_TEMPLATE = """
                         <th>Side</th>
                         <th>Size (BTC)</th>
                         <th>Fill Price</th>
-                        <th>SMA 40</th>
-                        <th>SMA 120</th>
+                        <th>SMA 1</th>
+                        <th>SMA 2</th>
+                        <th>Cross Flag</th>
                         <th>Stop %</th>
-                        <th>Stop Distance</th>
                         <th>Portfolio Value</th>
                     </tr>
                 </thead>
@@ -619,10 +670,10 @@ HTML_TEMPLATE = """
                         <td class="{{ trade.signal.lower() }}">{{ trade.side.upper() }}</td>
                         <td>{{ trade.size_btc }}</td>
                         <td>${{ trade.fill_price }}</td>
-                        <td>${{ trade.sma_40 }}</td>
-                        <td>${{ trade.sma_120 }}</td>
+                        <td>${{ trade.sma_1 }}</td>
+                        <td>${{ trade.sma_2 }}</td>
+                        <td>{{ trade.cross_flag }}</td>
                         <td>{{ trade.stop_loss_pct }}%</td>
-                        <td>${{ trade.stop_distance }}</td>
                         <td>${{ trade.portfolio_value }}</td>
                     </tr>
                     {% endfor %}
@@ -687,16 +738,31 @@ def dashboard():
     
     # Market data
     market_price = f"{market_data.get('current_price', 0):.2f}"
-    sma_40 = f"{market_data.get('sma_40', 0):.2f}"
-    sma_120 = f"{market_data.get('sma_120', 0):.2f}"
+    sma_1 = f"{market_data.get('sma_1', 0):.2f}"
+    sma_2 = f"{market_data.get('sma_2', 0):.2f}"
+    upper_band = f"{market_data.get('upper_band', 0):.2f}"
+    lower_band = f"{market_data.get('lower_band', 0):.2f}"
     market_signal = market_data.get('signal', 'N/A')
+    
+    # Cross flag
+    cross_flag = state.get('cross_flag', 0)
+    if cross_flag == 1:
+        cross_flag_text = "↑ UP"
+        cross_flag_class = "cross-up"
+    elif cross_flag == -1:
+        cross_flag_text = "↓ DOWN"
+        cross_flag_class = "cross-down"
+    else:
+        cross_flag_text = "—"
+        cross_flag_class = "cross-none"
     
     # Strategy info
     strategy_info = state.get("strategy_info", {})
-    sma_period_long = strategy_info.get('sma_period_long', 365)
-    sma_period_short = strategy_info.get('sma_period_short', 120)
-    stop_loss_pct = strategy_info.get('stop_loss_pct', 5.0)
-    leverage = strategy_info.get('leverage', 4)
+    sma_period_1 = strategy_info.get('sma_period_1', 57)
+    sma_period_2 = strategy_info.get('sma_period_2', 124)
+    band_width_pct = strategy_info.get('band_width_pct', 5.0)
+    stop_loss_pct = strategy_info.get('stop_loss_pct', 2.0)
+    leverage = strategy_info.get('leverage', 3)
     
     # Format trades
     trades = []
@@ -710,9 +776,9 @@ def dashboard():
         trade_copy['size_btc'] = f"{trade.get('size_btc', 0):.4f}"
         trade_copy['fill_price'] = f"{trade.get('fill_price', 0):.2f}"
         trade_copy['portfolio_value'] = f"{trade.get('portfolio_value', 0):.2f}"
-        trade_copy['sma_40'] = f"{trade.get('sma_40', 0):.2f}"
-        trade_copy['sma_120'] = f"{trade.get('sma_120', 0):.2f}"
-        trade_copy['stop_distance'] = f"{trade.get('stop_distance', 0):.2f}"
+        trade_copy['sma_1'] = f"{trade.get('sma_1', 0):.2f}"
+        trade_copy['sma_2'] = f"{trade.get('sma_2', 0):.2f}"
+        trade_copy['cross_flag'] = trade.get('cross_flag', 0)
         trade_copy['stop_loss_pct'] = f"{trade.get('stop_loss_pct', 2.0):.1f}"
         trades.append(trade_copy)
     
@@ -732,11 +798,17 @@ def dashboard():
         total_return_raw=total_return_raw,
         total_trades=total_trades,
         market_price=market_price,
-        sma_40=sma_40,
-        sma_120=sma_120,
+        sma_1=sma_1,
+        sma_2=sma_2,
+        upper_band=upper_band,
+        lower_band=lower_band,
         market_signal=market_signal,
-        sma_period_long=sma_period_long,
-        sma_period_short=sma_period_short,
+        cross_flag=cross_flag,
+        cross_flag_text=cross_flag_text,
+        cross_flag_class=cross_flag_class,
+        sma_period_1=sma_period_1,
+        sma_period_2=sma_period_2,
+        band_width_pct=band_width_pct,
         stop_loss_pct=stop_loss_pct,
         leverage=leverage,
         trades=trades,
