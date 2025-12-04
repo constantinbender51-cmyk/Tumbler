@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """
-tumbler.py - SMA 365 + 120 BTC Trading Strategy
-Uses 365-day SMA with 120-day SMA filter and 5% static stop loss
-Trades daily at 00:01 UTC:
-- LONG if price > SMA 365 AND price > SMA 120
-- SHORT if price < SMA 365 AND price < SMA 120
-- FLAT otherwise (stay out of market)
+tumbler.py - Dual SMA Strategy with State Machine
+SMA 1 (57 days): Primary logic with proximity bands and cross detection
+SMA 2 (124 days): Hard trend filter
+Trades daily at 00:01 UTC with 2% stop loss and 3x leverage
 """
 
 import json
@@ -33,92 +31,119 @@ SYMBOL_OHLC_KRAKEN = "XBTUSD"
 SYMBOL_OHLC_BINANCE = "BTCUSDT"
 INTERVAL_KRAKEN = 1440
 INTERVAL_BINANCE = "1d"
-SMA_PERIOD_LONG = 40  # Primary trend indicator
-SMA_PERIOD_SHORT = 120  # Trend filter
-ATR_PERIOD = 14
+
+# Strategy Parameters (from optimization)
+SMA_PERIOD_1 = 57   # Primary logic SMA
+SMA_PERIOD_2 = 124  # Filter SMA
+BAND_WIDTH = 0.05   # 5% proximity bands around SMA 1
 STATIC_STOP_PCT = 0.02  # 2% static stop loss
-LEV = 3.5  # 3.5x leverage
+LEV = 3  # 3x leverage
 LIMIT_OFFSET_PCT = 0.0002  # 0.02% offset for limit orders
-STOP_WAIT_TIME = 600  # Wait 10 minutes before placing stop loss
+STOP_WAIT_TIME = 600  # Wait 10 minutes
+
 STATE_FILE = Path("sma_state.json")
-TEST_SIZE_BTC = 0.0001
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s %(message)s",
 )
-log = logging.getLogger("sma_strategy")
+log = logging.getLogger("dual_sma_strategy")
 
 
-def calculate_sma_and_atr(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculate 40-day SMA, 120-day SMA, and 14-day ATR"""
+def calculate_smas(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculate SMA 1 (57) and SMA 2 (124)"""
     df = df.copy()
-    
-    # Calculate SMAs
-    df['sma_40'] = df['close'].rolling(window=SMA_PERIOD_LONG).mean()
-    df['sma_120'] = df['close'].rolling(window=SMA_PERIOD_SHORT).mean()
-    
-    # Calculate True Range
-    df['tr'] = np.maximum(
-        df['high'] - df['low'],
-        np.maximum(
-            abs(df['high'] - df['close'].shift(1)),
-            abs(df['low'] - df['close'].shift(1))
-        )
-    )
-    
-    # Calculate 14-day ATR
-    df['atr'] = df['tr'].rolling(window=ATR_PERIOD).mean()
-    
+    df['sma_1'] = df['close'].rolling(window=SMA_PERIOD_1).mean()
+    df['sma_2'] = df['close'].rolling(window=SMA_PERIOD_2).mean()
     return df
 
 
-def generate_signal(df: pd.DataFrame, current_price: float) -> Tuple[str, float, float, float]:
+def generate_signal(df: pd.DataFrame, current_price: float, prev_cross_flag: int) -> Tuple[str, float, float, int]:
     """
-    Generate trading signal based on SMA 40 with SMA 120 filter
-    Returns: (signal, sma_40, sma_120, atr)
+    Generate trading signal using dual SMA strategy with state machine
     
-    Logic:
-    - LONG: price > SMA 40 AND price > SMA 120
-    - SHORT: price < SMA 40 AND price < SMA 120
-    - FLAT: otherwise (contradictory signals)
+    Returns: (signal, sma_1, sma_2, new_cross_flag)
+    
+    State Machine Logic:
+    - cross_flag = 0: No recent cross
+    - cross_flag = 1: Just crossed UP through SMA 1
+    - cross_flag = -1: Just crossed DOWN through SMA 1
+    
+    Signal Logic:
+    - LONG: (price > upper_band) OR (price > SMA1 AND cross_flag=1)
+    - SHORT: (price < lower_band) OR (price < SMA1 AND cross_flag=-1)
+    - Filter: LONG requires price > SMA2, SHORT requires price < SMA2
     """
-    df_calc = calculate_sma_and_atr(df)
+    df_calc = calculate_smas(df)
     
     # Get latest values
-    sma_40 = df_calc['sma_40'].iloc[-1]
-    sma_120 = df_calc['sma_120'].iloc[-1]
-    atr = df_calc['atr'].iloc[-1]
+    sma_1 = df_calc['sma_1'].iloc[-1]
+    sma_2 = df_calc['sma_2'].iloc[-1]
+    
+    # Get previous close for cross detection
+    prev_close = df_calc['close'].iloc[-2]
     
     # Check if we have valid values
-    if pd.isna(sma_40) or pd.isna(sma_120) or pd.isna(atr):
-        raise ValueError("Not enough historical data for SMA 40, SMA 120, or ATR calculation")
+    if pd.isna(sma_1) or pd.isna(sma_2):
+        raise ValueError(f"Not enough historical data for SMA {SMA_PERIOD_1} or SMA {SMA_PERIOD_2}")
     
-    # Generate signal with 120 SMA filter
+    # Calculate proximity bands around SMA 1
+    upper_band = sma_1 * (1 + BAND_WIDTH)
+    lower_band = sma_1 * (1 - BAND_WIDTH)
+    
+    # Update cross flag based on previous close to current price
+    cross_flag = prev_cross_flag
+    
+    # Detect crosses
+    if prev_close < sma_1 and current_price > sma_1:
+        cross_flag = 1  # Just crossed UP
+        log.info("CROSS UP detected through SMA 1")
+    elif prev_close > sma_1 and current_price < sma_1:
+        cross_flag = -1  # Just crossed DOWN
+        log.info("CROSS DOWN detected through SMA 1")
+    
+    # Reset flag if price exits bands
+    if current_price > upper_band or current_price < lower_band:
+        if cross_flag != 0:
+            log.info("Price exited bands - resetting cross flag")
+        cross_flag = 0
+    
+    # Generate base signal from SMA 1 logic
     signal = "FLAT"
     
-    if current_price > sma_40:
-        # Primary signal is LONG
-        if current_price > sma_120:
-            signal = "LONG"  # Both conditions met
-        else:
-            signal = "FLAT"  # Price above 40 SMA but below 120 SMA - stay out
-            log.info("LONG signal filtered out: price below SMA 120")
-    else:
-        # Primary signal is SHORT
-        if current_price < sma_120:
-            signal = "SHORT"  # Both conditions met
-        else:
-            signal = "FLAT"  # Price below 40 SMA but above 120 SMA - stay out
-            log.info("SHORT signal filtered out: price above SMA 120")
+    # LONG conditions
+    if current_price > upper_band:
+        signal = "LONG"
+        log.info("LONG: Price above upper band")
+    elif current_price > sma_1 and cross_flag == 1:
+        signal = "LONG"
+        log.info("LONG: Price above SMA1 with recent cross UP")
+    # SHORT conditions
+    elif current_price < lower_band:
+        signal = "SHORT"
+        log.info("SHORT: Price below lower band")
+    elif current_price < sma_1 and cross_flag == -1:
+        signal = "SHORT"
+        log.info("SHORT: Price below SMA1 with recent cross DOWN")
+    
+    # Apply SMA 2 filter
+    if signal == "LONG" and current_price < sma_2:
+        log.info("LONG filtered out: price below SMA 2")
+        signal = "FLAT"
+    elif signal == "SHORT" and current_price > sma_2:
+        log.info("SHORT filtered out: price above SMA 2")
+        signal = "FLAT"
     
     log.info(f"Current price: ${current_price:.2f}")
-    log.info(f"SMA 40: ${sma_40:.2f}")
-    log.info(f"SMA 120: ${sma_120:.2f}")
-    log.info(f"ATR (14-day): ${atr:.2f}")
-    log.info(f"Signal: {signal}")
+    log.info(f"Previous close: ${prev_close:.2f}")
+    log.info(f"SMA 1 (57): ${sma_1:.2f}")
+    log.info(f"SMA 2 (124): ${sma_2:.2f}")
+    log.info(f"Upper band: ${upper_band:.2f}")
+    log.info(f"Lower band: ${lower_band:.2f}")
+    log.info(f"Cross flag: {cross_flag}")
+    log.info(f"Final signal: {signal}")
     
-    return signal, sma_40, sma_120, atr
+    return signal, sma_1, sma_2, cross_flag
 
 
 def portfolio_usd(api: kf.KrakenFuturesApi) -> float:
@@ -283,7 +308,7 @@ def place_entry_market_remaining(api: kf.KrakenFuturesApi, side: str, intended_s
 
 
 def place_stop(api: kf.KrakenFuturesApi, side: str, size_btc: float, fill_price: float):
-    """Place 5% static stop loss"""
+    """Place 2% static stop loss"""
     stop_distance = fill_price * STATIC_STOP_PCT
     
     if side == "buy":
@@ -295,7 +320,7 @@ def place_stop(api: kf.KrakenFuturesApi, side: str, size_btc: float, fill_price:
         stop_side = "buy"
         limit_price = stop_price * 1.0001
     
-    log.info(f"Placing 5% static stop: {stop_side} at ${stop_price:.2f} (distance: ${stop_distance:.2f})")
+    log.info(f"Placing 2% static stop: {stop_side} at ${stop_price:.2f} (distance: ${stop_distance:.2f})")
     
     try:
         api.send_order({
@@ -334,8 +359,8 @@ def smoke_test(api: kf.KrakenFuturesApi):
         df = kraken_ohlc.get_ohlc(SYMBOL_OHLC_KRAKEN, INTERVAL_KRAKEN)
         log.info(f"Historical data: {len(df)} days available")
         
-        if len(df) < SMA_PERIOD_LONG:
-            log.warning(f"Only {len(df)} days available, need {SMA_PERIOD_LONG} for SMA calculation")
+        if len(df) < SMA_PERIOD_2:
+            log.warning(f"Only {len(df)} days available, need {SMA_PERIOD_2} for SMA calculation")
         
         log.info("=== Smoke-test complete ===")
         return True
@@ -351,7 +376,8 @@ def load_state() -> Dict:
         "performance": {},
         "current_position": None,
         "current_portfolio_value": 0,
-        "strategy_info": {}
+        "strategy_info": {},
+        "cross_flag": 0  # State machine flag
     }
 
 
@@ -388,14 +414,19 @@ def update_state_with_current_position(api: kf.KrakenFuturesApi):
     # Ensure strategy_info exists
     if "strategy_info" not in state:
         state["strategy_info"] = {
-            "sma_period_long": SMA_PERIOD_LONG,
-            "sma_period_short": SMA_PERIOD_SHORT,
+            "sma_period_1": SMA_PERIOD_1,
+            "sma_period_2": SMA_PERIOD_2,
+            "band_width_pct": BAND_WIDTH * 100,
             "stop_loss_pct": STATIC_STOP_PCT * 100,
             "leverage": LEV,
             "order_type": "limit",
             "limit_offset_pct": LIMIT_OFFSET_PCT * 100,
             "last_updated": datetime.now(timezone.utc).isoformat()
         }
+    
+    # Initialize cross_flag if not present
+    if "cross_flag" not in state:
+        state["cross_flag"] = 0
     
     save_state(state)
     log.info(f"Updated state with current position and portfolio value: ${portfolio_value:.2f}")
@@ -419,8 +450,15 @@ def daily_trade(api: kf.KrakenFuturesApi):
     if state["starting_capital"] is None:
         state["starting_capital"] = portfolio_value
     
-    # Generate signal
-    signal, sma_40, sma_120, atr = generate_signal(df, current_price)
+    # Get previous cross flag from state
+    prev_cross_flag = state.get("cross_flag", 0)
+    log.info(f"Previous cross flag: {prev_cross_flag}")
+    
+    # Generate signal with state machine
+    signal, sma_1, sma_2, new_cross_flag = generate_signal(df, current_price, prev_cross_flag)
+    
+    # Update cross flag in state
+    state["cross_flag"] = new_cross_flag
     
     # === STEP 1: Flatten with limit order ===
     log.info("=== STEP 1: Flatten with limit order ===")
@@ -454,11 +492,11 @@ def daily_trade(api: kf.KrakenFuturesApi):
             "size_btc": 0,
             "fill_price": current_price,
             "portfolio_value": collateral,
-            "sma_40": sma_40,
-            "sma_120": sma_120,
-            "atr": atr,
+            "sma_1": sma_1,
+            "sma_2": sma_2,
+            "cross_flag": new_cross_flag,
             "stop_distance": 0,
-            "note": "Stayed flat due to SMA filter"
+            "note": "Stayed flat due to signal logic"
         }
         
         state["trades"].append(trade_record)
@@ -515,9 +553,9 @@ def daily_trade(api: kf.KrakenFuturesApi):
             "size_btc": final_size if not dry else size_btc,
             "fill_price": fill_price,
             "portfolio_value": collateral,
-            "sma_40": sma_40,
-            "sma_120": sma_120,
-            "atr": atr,
+            "sma_1": sma_1,
+            "sma_2": sma_2,
+            "cross_flag": new_cross_flag,
             "stop_distance": stop_distance,
             "stop_loss_pct": STATIC_STOP_PCT * 100,
         }
@@ -536,8 +574,9 @@ def daily_trade(api: kf.KrakenFuturesApi):
     
     # Update strategy info
     state["strategy_info"] = {
-        "sma_period_long": SMA_PERIOD_LONG,
-        "sma_period_short": SMA_PERIOD_SHORT,
+        "sma_period_1": SMA_PERIOD_1,
+        "sma_period_2": SMA_PERIOD_2,
+        "band_width_pct": BAND_WIDTH * 100,
         "stop_loss_pct": STATIC_STOP_PCT * 100,
         "leverage": LEV,
         "order_type": "limit",
@@ -547,6 +586,7 @@ def daily_trade(api: kf.KrakenFuturesApi):
     
     save_state(state)
     log.info(f"Trade executed and logged. Portfolio: ${collateral:.2f}")
+    log.info(f"New cross flag saved: {new_cross_flag}")
 
 
 def wait_until_00_01_utc():
@@ -569,7 +609,7 @@ def main():
 
     api = kf.KrakenFuturesApi(api_key, api_sec)
     
-    log.info("Initializing strategy and state...")
+    log.info("Initializing Dual SMA strategy with state machine...")
     
     # Run smoke test first
     if not smoke_test(api):
