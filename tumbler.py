@@ -336,7 +336,7 @@ def place_stop(api: kf.KrakenFuturesApi, side: str, size_btc: float, fill_price:
 
 
 def smoke_test(api: kf.KrakenFuturesApi):
-    """Run smoke test to verify API connectivity"""
+    """Run smoke test to verify API connectivity and order placement"""
     log.info("=== Smoke-test start ===")
     
     try:
@@ -362,10 +362,123 @@ def smoke_test(api: kf.KrakenFuturesApi):
         if len(df) < SMA_PERIOD_2:
             log.warning(f"Only {len(df)} days available, need {SMA_PERIOD_2} for SMA calculation")
         
+        # === TEST ORDER PLACEMENT ===
+        log.info("=== Testing Order Placement ===")
+        
+        # Calculate test order size (very small to minimize risk)
+        test_collateral = usd
+        test_notional = test_collateral * LEV
+        test_size = test_notional / mp
+        test_size_rounded = round(test_size, 4)
+        
+        log.info(f"Test order calculation:")
+        log.info(f"  Collateral: ${test_collateral:.2f}")
+        log.info(f"  Leverage: {LEV}x")
+        log.info(f"  Notional: ${test_notional:.2f}")
+        log.info(f"  Price: ${mp:.2f}")
+        log.info(f"  Raw size: {test_size:.8f} BTC")
+        log.info(f"  Rounded size: {test_size_rounded:.4f} BTC")
+        
+        # Test BUY limit order
+        buy_limit_price = mp * (1 - LIMIT_OFFSET_PCT)
+        buy_limit_price_int = int(round(buy_limit_price))
+        
+        log.info(f"Test BUY limit order:")
+        log.info(f"  Side: buy")
+        log.info(f"  Size (raw): {test_size_rounded}")
+        log.info(f"  Size (rounded): {round(test_size_rounded, 4)}")
+        log.info(f"  Limit price (raw): ${buy_limit_price:.2f}")
+        log.info(f"  Limit price (int): ${buy_limit_price_int}")
+        log.info(f"  Offset: {LIMIT_OFFSET_PCT * 100}% below market")
+        
+        try:
+            test_order_params = {
+                "orderType": "lmt",
+                "symbol": SYMBOL_FUTS_LC,
+                "side": "buy",
+                "size": round(test_size_rounded, 4),
+                "limitPrice": buy_limit_price_int,
+            }
+            log.info(f"Sending order with params: {test_order_params}")
+            
+            test_order = api.send_order(test_order_params)
+            log.info(f"Order response: {test_order}")
+            
+            if test_order.get("sendStatus", {}).get("status") == "placed":
+                order_id = test_order.get("sendStatus", {}).get("order_id")
+                log.info(f"✓ Test BUY limit order placed successfully! Order ID: {order_id}")
+                
+                # Wait a moment then cancel it
+                time.sleep(2)
+                log.info(f"Cancelling test order {order_id}...")
+                cancel_result = api.cancel_order({"order_id": order_id})
+                log.info(f"Cancel result: {cancel_result}")
+            else:
+                log.error(f"✗ Test order failed: {test_order}")
+                
+        except Exception as e:
+            log.error(f"✗ Test order exception: {e}")
+        
+        # Test SELL limit order
+        sell_limit_price = mp * (1 + LIMIT_OFFSET_PCT)
+        sell_limit_price_int = int(round(sell_limit_price))
+        
+        log.info(f"Test SELL limit order:")
+        log.info(f"  Side: sell")
+        log.info(f"  Size (raw): {test_size_rounded}")
+        log.info(f"  Size (rounded): {round(test_size_rounded, 4)}")
+        log.info(f"  Limit price (raw): ${sell_limit_price:.2f}")
+        log.info(f"  Limit price (int): ${sell_limit_price_int}")
+        log.info(f"  Offset: {LIMIT_OFFSET_PCT * 100}% above market")
+        
+        try:
+            test_order_params = {
+                "orderType": "lmt",
+                "symbol": SYMBOL_FUTS_LC,
+                "side": "sell",
+                "size": round(test_size_rounded, 4),
+                "limitPrice": sell_limit_price_int,
+            }
+            log.info(f"Sending order with params: {test_order_params}")
+            
+            test_order = api.send_order(test_order_params)
+            log.info(f"Order response: {test_order}")
+            
+            if test_order.get("sendStatus", {}).get("status") == "placed":
+                order_id = test_order.get("sendStatus", {}).get("order_id")
+                log.info(f"✓ Test SELL limit order placed successfully! Order ID: {order_id}")
+                
+                # Wait a moment then cancel it
+                time.sleep(2)
+                log.info(f"Cancelling test order {order_id}...")
+                cancel_result = api.cancel_order({"order_id": order_id})
+                log.info(f"Cancel result: {cancel_result}")
+            else:
+                log.error(f"✗ Test order failed: {test_order}")
+                
+        except Exception as e:
+            log.error(f"✗ Test order exception: {e}")
+        
+        # Test stop loss order format
+        log.info(f"Test STOP LOSS order (not placing, just checking format):")
+        stop_distance = mp * STATIC_STOP_PCT
+        stop_price_buy = mp + stop_distance
+        stop_limit_buy = stop_price_buy * 1.0001
+        
+        log.info(f"  For a SHORT position (buy stop):")
+        log.info(f"    Entry price: ${mp:.2f}")
+        log.info(f"    Stop distance: ${stop_distance:.2f} ({STATIC_STOP_PCT * 100}%)")
+        log.info(f"    Stop price: ${stop_price_buy:.2f}")
+        log.info(f"    Stop price (int): {int(round(stop_price_buy))}")
+        log.info(f"    Limit price: ${stop_limit_buy:.2f}")
+        log.info(f"    Limit price (int): {int(round(stop_limit_buy))}")
+        
         log.info("=== Smoke-test complete ===")
         return True
     except Exception as e:
         log.error(f"Smoke test failed: {e}")
+        import traceback
+        log.error(traceback.format_exc())
         return False
 
 
