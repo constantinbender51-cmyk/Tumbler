@@ -32,12 +32,12 @@ SMA_PERIOD_2 = 124
 BAND_WIDTH = 5.0  # 5% bands
 STATIC_STOP_PCT = 2.0  # 2% static stop
 TAKE_PROFIT_PCT = 16.0  # 16% take profit
-III_WINDOW = 14
-III_T_LOW = 0.10
-III_T_HIGH = 0.50
-LEV_LOW = 0.0
-LEV_MID = 3.0
-LEV_HIGH = 1.5
+III_WINDOW = 35
+III_T_LOW = 0.13
+III_T_HIGH = 0.18
+LEV_LOW = 0.5
+LEV_MID = 4.5
+LEV_HIGH = 2.45
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -165,7 +165,7 @@ class DashboardMonitor:
             return pd.DataFrame()
 
     def calculate_iii(self, df: pd.DataFrame) -> float:
-        """Calculate Inefficiency Index (III) over the last 14 days"""
+        """Calculate Inefficiency Index (III) over the last 35 days"""
         if len(df) < III_WINDOW + 1:
             return 0.0
         
@@ -227,7 +227,7 @@ class DashboardMonitor:
         elif signal == "SHORT" and current_price > sma_2:
             signal = "FLAT"
         
-        # Override to FLAT if leverage is 0
+        # Override to FLAT if leverage is 0 (not applicable with new params, but kept for consistency)
         if leverage == 0:
             signal = "FLAT"
         
@@ -635,7 +635,7 @@ HTML_TEMPLATE = """
                 <div class="card-label">SMA1 - 5%</div>
             </div>
             <div class="card">
-                <h2>III (14-day)</h2>
+                <h2>III (35-day)</h2>
                 <div class="card-value">{{ iii }}</div>
                 <div class="card-label">Inefficiency Index</div>
             </div>
@@ -680,7 +680,7 @@ HTML_TEMPLATE = """
                 </div>
                 <div class="strategy-stat">
                     <div class="strategy-stat-label">Leverage Tiers</div>
-                    <div class="strategy-stat-value">0x/3x/1.5x</div>
+                    <div class="strategy-stat-value">0.5x/4.5x/2.45x</div>
                 </div>
             </div>
         </div>
