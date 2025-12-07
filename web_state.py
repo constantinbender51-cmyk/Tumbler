@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-web_state.py - Dual SMA Strategy Dashboard with State Machine
-Displays strategy with SMA 1 (57), SMA 2 (124), and cross flag state
+web_state.py - Dual SMA Strategy Dashboard with III Dynamic Leverage
+Displays strategy with SMA 1 (57), SMA 2 (124), III, and dynamic leverage
 """
 
 from flask import Flask, render_template_string
@@ -84,7 +84,9 @@ class DashboardMonitor:
                 "sma_period_2": SMA_PERIOD_2,
                 "band_width_pct": BAND_WIDTH,
                 "stop_loss_pct": STATIC_STOP_PCT,
-                "leverage": LEV
+                "take_profit_pct": TAKE_PROFIT_PCT,
+                "iii_window": III_WINDOW,
+                "leverage_tiers": f"{LEV_LOW}x / {LEV_MID}x / {LEV_HIGH}x"
             },
             "cross_flag": 0,
             "last_updated": None
@@ -189,15 +191,6 @@ class DashboardMonitor:
             return LEV_MID
         else:
             return LEV_HIGH
-        """Calculate SMA 1 (57) and SMA 2 (124)"""
-        if len(df) < SMA_PERIOD_2:
-            return 0, 0
-        
-        df = df.copy()
-        sma_1 = df['close'].rolling(window=SMA_PERIOD_1).mean().iloc[-1]
-        sma_2 = df['close'].rolling(window=SMA_PERIOD_2).mean().iloc[-1]
-        
-        return float(sma_1), float(sma_2)
 
     def calculate_smas(self, df: pd.DataFrame) -> tuple:
         """Calculate SMA 1 (57) and SMA 2 (124)"""
@@ -209,30 +202,6 @@ class DashboardMonitor:
         sma_2 = df['close'].rolling(window=SMA_PERIOD_2).mean().iloc[-1]
         
         return float(sma_1), float(sma_2)
-        """Generate trading signal based on dual SMA with state machine"""
-        upper_band = sma_1 * (1 + BAND_WIDTH / 100)
-        lower_band = sma_1 * (1 - BAND_WIDTH / 100)
-        
-        signal = "FLAT"
-        
-        # LONG conditions
-        if current_price > upper_band:
-            signal = "LONG"
-        elif current_price > sma_1 and cross_flag == 1:
-            signal = "LONG"
-        # SHORT conditions
-        elif current_price < lower_band:
-            signal = "SHORT"
-        elif current_price < sma_1 and cross_flag == -1:
-            signal = "SHORT"
-        
-        # Apply SMA 2 filter
-        if signal == "LONG" and current_price < sma_2:
-            signal = "FLAT"
-        elif signal == "SHORT" and current_price > sma_2:
-            signal = "FLAT"
-        
-        return signal
 
     def generate_signal(self, current_price: float, sma_1: float, sma_2: float, cross_flag: int, leverage: float) -> str:
         """Generate trading signal based on dual SMA with state machine"""
@@ -263,6 +232,8 @@ class DashboardMonitor:
             signal = "FLAT"
         
         return signal
+
+    def update_data(self):
         """Update all dashboard data"""
         if not self.api:
             self.initialize_api()
@@ -591,23 +562,6 @@ HTML_TEMPLATE = """
         .status-offline {
             background: #ff0000;
         }
-        .cross-flag {
-            font-weight: 600;
-            padding: 2px 6px;
-            border-radius: 3px;
-        }
-        .cross-up {
-            background: #e8f5e9;
-            color: #2e7d32;
-        }
-        .cross-down {
-            background: #ffebee;
-            color: #c62828;
-        }
-        .cross-none {
-            background: #f5f5f5;
-            color: #757575;
-        }
     </style>
 </head>
 <body>
@@ -662,18 +616,13 @@ HTML_TEMPLATE = """
                 <div class="card-label">124-day MA Filter</div>
             </div>
             <div class="card">
-                <h2>III (14-day)</h2>
-                <div class="card-value">{{ iii }}</div>
-                <div class="card-label">Inefficiency Index</div>
-            </div>
-            <div class="card">
-                <h2>Dynamic Leverage</h2>
-                <div class="card-value">{{ current_leverage }}x</div>
-                <div class="card-label">Based on III</div>
+                <h2>Signal</h2>
+                <div class="card-value">{{ market_signal }}</div>
+                <div class="card-label">Current Strategy Signal</div>
             </div>
         </div>
 
-        <!-- Bands Info -->
+        <!-- III and Leverage -->
         <div class="grid">
             <div class="card">
                 <h2>Upper Band</h2>
@@ -686,9 +635,14 @@ HTML_TEMPLATE = """
                 <div class="card-label">SMA1 - 5%</div>
             </div>
             <div class="card">
-                <h2>Signal</h2>
-                <div class="card-value">{{ market_signal }}</div>
-                <div class="card-label">Current Strategy Signal</div>
+                <h2>III (14-day)</h2>
+                <div class="card-value">{{ iii }}</div>
+                <div class="card-label">Inefficiency Index</div>
+            </div>
+            <div class="card">
+                <h2>Dynamic Leverage</h2>
+                <div class="card-value">{{ current_leverage }}x</div>
+                <div class="card-label">Based on III</div>
             </div>
         </div>
 
@@ -698,7 +652,7 @@ HTML_TEMPLATE = """
             <div class="strategy-info">
                 <div class="strategy-stat">
                     <div class="strategy-stat-label">Strategy Type</div>
-                    <div class="strategy-stat-value">Dual SMA</div>
+                    <div class="strategy-stat-value">Dual SMA + III</div>
                 </div>
                 <div class="strategy-stat">
                     <div class="strategy-stat-label">SMA 1 (Logic)</div>
@@ -717,8 +671,16 @@ HTML_TEMPLATE = """
                     <div class="strategy-stat-value">{{ stop_loss_pct }}%</div>
                 </div>
                 <div class="strategy-stat">
-                    <div class="strategy-stat-label">Leverage</div>
-                    <div class="strategy-stat-value">{{ leverage }}x</div>
+                    <div class="strategy-stat-label">Take Profit</div>
+                    <div class="strategy-stat-value">{{ take_profit_pct }}%</div>
+                </div>
+                <div class="strategy-stat">
+                    <div class="strategy-stat-label">III Window</div>
+                    <div class="strategy-stat-value">{{ iii_window }} days</div>
+                </div>
+                <div class="strategy-stat">
+                    <div class="strategy-stat-label">Leverage Tiers</div>
+                    <div class="strategy-stat-value">0x/3x/1.5x</div>
                 </div>
             </div>
         </div>
