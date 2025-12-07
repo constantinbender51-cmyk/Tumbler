@@ -608,6 +608,216 @@ def daily_trade(api: kf.KrakenFuturesApi):
             "sma_1": sma_1,
             "sma_2": sma_2,
             "cross_flag": new_cross_flag,
+            "iii": iii,
+            "leverage": leverage,
+            "stop_distance": 0,
+            "tp_distance": 0,
+            "note": "Stayed flat - no trade" if leverage == 0 else "Stayed flat due to signal logic"
+        }
+        
+        state["trades"].append(trade_record)
+        state["current_position"] = None
+        
+    else:
+        # Calculate position size for LONG or SHORT with dynamic leverage
+        notional = collateral * leverage
+        size_btc = round(notional / current_price, 4)
+        
+        side = "buy" if signal == "LONG" else "sell"
+        
+        log.info(f"Opening {signal} position with {leverage}x leverage: {size_btc} BTC")
+        
+        if dry:
+            log.info(f"DRY-RUN: {signal} {size_btc} BTC at ${current_price:.2f}")
+            fill_price = current_price
+            final_size = size_btc
+        else:
+            # === STEP 5: Place entry limit order ===
+            log.info("=== STEP 5: Place entry limit order ===")
+            limit_price = place_entry_limit(api, side, size_btc, current_price)
+            
+            # === STEP 6: Sleep 600 seconds ===
+            log.info("=== STEP 6: Sleeping 600 seconds ===")
+            time.sleep(600)
+            
+            # === STEP 7: Place entry market for remaining ===
+            log.info("=== STEP 7: Place entry market for remaining ===")
+            # Get fresh current price after 10 minutes
+            current_price = mark_price(api)
+            final_size = place_entry_market_remaining(api, side, size_btc, current_price)
+            
+            # Use current price as fill price for simplicity
+            fill_price = current_price
+            
+            # === STEP 8: Cancel all orders ===
+            log.info("=== STEP 8: Cancel all orders ===")
+            cancel_all(api)
+            time.sleep(2)
+            
+            log.info(f"Final position: {final_size:.4f} BTC @ ${fill_price:.2f} (current market price)")
+            
+            # === STEP 9: Place stop loss ===
+            log.info("=== STEP 9: Place stop loss ===")
+            place_stop(api, side, final_size, fill_price)
+            
+            # === STEP 10: Place take profit ===
+            log.info("=== STEP 10: Place take profit ===")
+            place_take_profit(api, side, final_size, fill_price)
+        
+        # Record trade
+        stop_distance = fill_price * STATIC_STOP_PCT
+        tp_distance = fill_price * TAKE_PROFIT_PCT
+        
+        trade_record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "signal": signal,
+            "side": side,
+            "size_btc": final_size if not dry else size_btc,
+            "fill_price": fill_price,
+            "portfolio_value": collateral,
+            "sma_1": sma_1,
+            "sma_2": sma_2,
+            "cross_flag": new_cross_flag,
+            "iii": iii,
+            "leverage": leverage,
+            "stop_distance": stop_distance,
+            "stop_loss_pct": STATIC_STOP_PCT * 100,
+            "tp_distance": tp_distance,
+            "take_profit_pct": TAKE_PROFIT_PCT * 100,
+        }
+        
+        state["trades"].append(trade_record)
+    
+    # Calculate performance
+    if state["starting_capital"]:
+        total_return = (collateral - state["starting_capital"]) / state["starting_capital"] * 100
+        state["performance"] = {
+            "current_value": collateral,
+            "starting_capital": state["starting_capital"],
+            "total_return_pct": total_return,
+            "total_trades": len(state["trades"]),
+        }
+    
+    # Update strategy info
+    state["strategy_info"] = {
+        "sma_period_1": SMA_PERIOD_1,
+        "sma_period_2": SMA_PERIOD_2,
+        "band_width_pct": BAND_WIDTH * 100,
+        "stop_loss_pct": STATIC_STOP_PCT * 100,
+        "take_profit_pct": TAKE_PROFIT_PCT * 100,
+        "iii_window": III_WINDOW,
+        "leverage_tiers": f"{LEV_LOW}x / {LEV_MID}x / {LEV_HIGH}x",
+        "current_iii": iii,
+        "current_leverage": leverage,
+        "order_type": "limit",
+        "limit_offset_pct": LIMIT_OFFSET_PCT * 100,
+        "last_updated": datetime.now(timezone.utc).isoformat()
+    }
+    
+    save_state(state)
+    log.info(f"Trade executed and logged. Portfolio: ${collateral:.2f}")
+    log.info(f"New cross flag saved: {new_cross_flag}")
+    log.info(f"III: {iii:.4f}, Leverage: {leverage}x")
+
+
+def wait_until_00_01_utc():
+    """Wait until 00:01 UTC for daily execution"""
+    now = datetime.now(timezone.utc)
+    next_run = now.replace(hour=0, minute=1, second=0, microsecond=0)
+    if now >= next_run:
+        next_run += timedelta(days=1)
+    wait_sec = (next_run - now).total_seconds()
+    log.info("Next run at 00:01 UTC (%s), sleeping %.0f s", next_run.strftime("%Y-%m-%d"), wait_sec)
+    time.sleep(wait_sec)
+
+
+def main():
+    api_key = os.getenv("KRAKEN_API_KEY")
+    api_sec = os.getenv("KRAKEN_API_SECRET")
+    if not api_key or not api_sec:
+        log.error("Env vars KRAKEN_API_KEY / KRAKEN_API_SECRET missing")
+        sys.exit(1)
+
+    api = kf.KrakenFuturesApi(api_key, api_sec)
+    
+    log.info("Initializing Dual SMA strategy with III dynamic leverage...")
+    
+    # Run smoke test first
+    if not smoke_test(api):
+        log.error("Smoke test failed, exiting")
+        sys.exit(1)
+    
+    # Update state with current position - this creates the state file
+    update_state_with_current_position(api)
+    
+    log.info("State file initialized with current portfolio data")
+    
+    # Ensure state file exists and is written
+    if STATE_FILE.exists():
+        log.info(f"State file confirmed at: {STATE_FILE.absolute()}")
+    else:
+        log.error("State file was not created!")
+
+    if RUN_TRADE_NOW:
+        log.info("RUN_TRADE_NOW=true – executing trade now")
+        try:
+            daily_trade(api)
+        except Exception as exc:
+            log.exception("Immediate trade failed: %s", exc)
+
+    log.info("Starting web dashboard on port %s", os.getenv("PORT", 8080))
+    time.sleep(1)  # Give state file time to be fully written
+    subprocess.Popen([sys.executable, "web_state.py"])
+
+    while True:
+        wait_until_00_01_utc()
+        try:
+            daily_trade(api)
+        except KeyboardInterrupt:
+            log.info("Interrupted")
+            break
+        except Exception as exc:
+            log.exception("Daily trade failed: %s", exc)
+
+
+if __name__ == "__main__":
+    main()
+
+            log.info("Interrupted")
+            break
+        except Exception as exc:
+            log.exception("Daily trade failed: %s", exc)
+
+
+if __name__ == "__main__":
+    main()
+ with market order ===
+    log.info("=== STEP 3: Flatten remaining with market order ===")
+    flatten_position_market(api)
+    
+    # === STEP 4: Cancel all orders ===
+    log.info("=== STEP 4: Cancel all orders ===")
+    cancel_all(api)
+    time.sleep(2)
+    
+    # Get fresh portfolio value after flatten
+    collateral = portfolio_usd(api)
+    
+    # Handle FLAT signal - stay out of market
+    if signal == "FLAT":
+        log.info("Signal is FLAT - staying out of market (no position)")
+        
+        # Record the decision to stay flat
+        trade_record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "signal": "FLAT",
+            "side": "none",
+            "size_btc": 0,
+            "fill_price": current_price,
+            "portfolio_value": collateral,
+            "sma_1": sma_1,
+            "sma_2": sma_2,
+            "cross_flag": new_cross_flag,
             "stop_distance": 0,
             "note": "Stayed flat due to signal logic"
         }
