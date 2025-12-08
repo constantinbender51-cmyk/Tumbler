@@ -7,3 +7,4 @@ gunicorn
 setuptools
 tensorflow
 python-dotenv
+matplotlib
