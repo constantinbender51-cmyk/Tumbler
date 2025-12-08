@@ -89,13 +89,11 @@ class DashboardMonitor:
             "strategy_info": {
                 "sma_period_1": SMA_PERIOD_1,
                 "sma_period_2": SMA_PERIOD_2,
-                "band_width_pct": BAND_WIDTH,
                 "stop_loss_pct": STATIC_STOP_PCT,
                 "take_profit_pct": TAKE_PROFIT_PCT,
                 "iii_window": III_WINDOW,
                 "leverage_tiers": f"{LEV_LOW}x / {LEV_MID}x / {LEV_HIGH}x"
             },
-            "cross_flag": 0,
             "last_updated": None
         }
 
@@ -384,33 +382,16 @@ class DashboardMonitor:
             import traceback
             log.error(traceback.format_exc())
 
-    def generate_signal(self, current_price: float, sma_1: float, sma_2: float, cross_flag: int, leverage: float) -> str:
-        """Generate trading signal based on dual SMA with state machine"""
-        upper_band = sma_1 * (1 + BAND_WIDTH / 100)
-        lower_band = sma_1 * (1 - BAND_WIDTH / 100)
-        
+    def generate_signal(self, current_price: float, sma_1: float, sma_2: float, prev_close: float, leverage: float) -> str:
+        """Generate trading signal based on dual SMA (simplified backtest logic)"""
         signal = "FLAT"
         
-        # LONG conditions
-        if current_price > upper_band:
+        # LONG: prev_close above both SMAs
+        if prev_close > sma_1 and prev_close > sma_2:
             signal = "LONG"
-        elif current_price > sma_1 and cross_flag == 1:
-            signal = "LONG"
-        # SHORT conditions
-        elif current_price < lower_band:
+        # SHORT: prev_close below both SMAs
+        elif prev_close < sma_1 and prev_close < sma_2:
             signal = "SHORT"
-        elif current_price < sma_1 and cross_flag == -1:
-            signal = "SHORT"
-        
-        # Apply SMA 2 filter
-        if signal == "LONG" and current_price < sma_2:
-            signal = "FLAT"
-        elif signal == "SHORT" and current_price > sma_2:
-            signal = "FLAT"
-        
-        # Override to FLAT if leverage is 0 (not applicable with new params, but kept for consistency)
-        if leverage == 0:
-            signal = "FLAT"
         
         return signal
 
@@ -432,12 +413,14 @@ class DashboardMonitor:
             sma_1, sma_2 = self.calculate_smas(ohlc_data)
             iii = self.calculate_iii(ohlc_data)
             leverage = self.determine_leverage(iii)
-            cross_flag = self.state.get("cross_flag", 0)
-            signal = self.generate_signal(mark_price, sma_1, sma_2, cross_flag, leverage)
             
-            # Calculate bands
-            upper_band = sma_1 * (1 + BAND_WIDTH / 100)
-            lower_band = sma_1 * (1 - BAND_WIDTH / 100)
+            # Get previous close for signal generation
+            prev_close = ohlc_data['close'].iloc[-2] if len(ohlc_data) > 1 else mark_price
+            signal = self.generate_signal(mark_price, sma_1, sma_2, prev_close, leverage)
+            
+            # Calculate bands for display (not used in signal)
+            upper_band = sma_1 * 1.05
+            lower_band = sma_1 * 0.95
             
             # Update performance metrics
             if self.state["performance"]["starting_capital"] == 0:
@@ -507,7 +490,6 @@ class DashboardMonitor:
                 "portfolio_value": self.state["performance"]["current_value"],
                 "sma_1": self.state["market_data"].get("sma_1", 0),
                 "sma_2": self.state["market_data"].get("sma_2", 0),
-                "cross_flag": self.state.get("cross_flag", 0),
                 "iii": self.state["market_data"].get("iii", 0),
                 "leverage": self.state["market_data"].get("leverage", 0),
                 "stop_distance": (current_price * (STATIC_STOP_PCT / 100)) if current_position else 0,
