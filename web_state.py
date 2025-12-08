@@ -4,7 +4,7 @@ web_state.py - Dual SMA Strategy Dashboard with III Dynamic Leverage
 Displays strategy with SMA 1 (57), SMA 2 (124), III, and dynamic leverage
 """
 
-from flask import Flask, render_template_string
+from flask import Flask, render_template_string, send_file
 import json
 import os
 import time
@@ -15,6 +15,10 @@ import requests
 import pandas as pd
 import numpy as np
 from typing import Dict, Any, Optional
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 app = Flask(__name__)
 
@@ -23,13 +27,13 @@ import kraken_futures as kf
 
 # Configuration
 STATE_FILE = Path("web_state.json")
+BACKTEST_CHART_PATH = Path("/app/static/backtest.png")
 UPDATE_INTERVAL = 300  # 5 minutes
 SYMBOL_FUTS_UC = "PF_XBTUSD"
 SYMBOL_OHLC_KRAKEN = "XBTUSD"
 INTERVAL_KRAKEN = 1440
-SMA_PERIOD_1 = 57
-SMA_PERIOD_2 = 124
-BAND_WIDTH = 5.0  # 5% bands
+SMA_PERIOD_1 = 40
+SMA_PERIOD_2 = 120
 STATIC_STOP_PCT = 2.0  # 2% static stop
 TAKE_PROFIT_PCT = 16.0  # 16% take profit
 III_WINDOW = 35
@@ -48,6 +52,9 @@ class DashboardMonitor:
         self.api = None
         self.last_update = None
         self.state = self.load_state()
+        # Ensure static directory exists
+        static_dir = Path("/app/static")
+        static_dir.mkdir(parents=True, exist_ok=True)
         
     def initialize_api(self):
         """Initialize Kraken API client"""
@@ -202,6 +209,180 @@ class DashboardMonitor:
         sma_2 = df['close'].rolling(window=SMA_PERIOD_2).mean().iloc[-1]
         
         return float(sma_1), float(sma_2)
+    
+    def run_backtest(self, df: pd.DataFrame, initial_capital: float = 1000.0) -> pd.DataFrame:
+        """
+        Run backtest on historical data (last 720 days)
+        Returns DataFrame with equity, signal, and leverage for each day
+        """
+        # Limit to 720 days
+        df = df.tail(720).copy()
+        
+        # Calculate SMAs
+        df['sma_1'] = df['close'].rolling(window=SMA_PERIOD_1).mean()
+        df['sma_2'] = df['close'].rolling(window=SMA_PERIOD_2).mean()
+        
+        # Calculate III
+        iii_values = []
+        for i in range(len(df)):
+            if i < III_WINDOW:
+                iii_values.append(0.0)
+            else:
+                window_df = df.iloc[max(0, i-III_WINDOW):i+1]
+                iii = self.calculate_iii(window_df)
+                iii_values.append(iii)
+        df['iii'] = iii_values
+        
+        # Determine leverage for each day
+        df['leverage'] = df['iii'].apply(self.determine_leverage)
+        
+        # Generate signals (using previous close vs SMAs)
+        signals = []
+        for i in range(len(df)):
+            if i == 0 or pd.isna(df['sma_1'].iloc[i]) or pd.isna(df['sma_2'].iloc[i]):
+                signals.append('FLAT')
+            else:
+                prev_close = df['close'].iloc[i-1]
+                sma_1 = df['sma_1'].iloc[i]
+                sma_2 = df['sma_2'].iloc[i]
+                
+                if prev_close > sma_1 and prev_close > sma_2:
+                    signals.append('LONG')
+                elif prev_close < sma_1 and prev_close < sma_2:
+                    signals.append('SHORT')
+                else:
+                    signals.append('FLAT')
+        df['signal'] = signals
+        
+        # Backtest with SL/TP
+        equity = initial_capital
+        equity_curve = []
+        
+        for i in range(len(df)):
+            if i == 0:
+                equity_curve.append(equity)
+                continue
+            
+            signal = df['signal'].iloc[i]
+            leverage = df['leverage'].iloc[i]
+            open_price = df['open'].iloc[i]
+            high_price = df['high'].iloc[i]
+            low_price = df['low'].iloc[i]
+            close_price = df['close'].iloc[i]
+            
+            daily_return = 0.0
+            
+            if signal == 'LONG':
+                entry = open_price
+                sl = entry * (1 - STATIC_STOP_PCT / 100)
+                tp = entry * (1 + TAKE_PROFIT_PCT / 100)
+                
+                if low_price <= sl:
+                    daily_return = -(STATIC_STOP_PCT / 100)
+                elif high_price >= tp:
+                    daily_return = (TAKE_PROFIT_PCT / 100)
+                else:
+                    daily_return = (close_price - entry) / entry
+                    
+            elif signal == 'SHORT':
+                entry = open_price
+                sl = entry * (1 + STATIC_STOP_PCT / 100)
+                tp = entry * (1 - TAKE_PROFIT_PCT / 100)
+                
+                if high_price >= sl:
+                    daily_return = -(STATIC_STOP_PCT / 100)
+                elif low_price <= tp:
+                    daily_return = (TAKE_PROFIT_PCT / 100)
+                else:
+                    daily_return = (entry - close_price) / entry
+            
+            # Apply leverage
+            leveraged_return = daily_return * leverage
+            equity *= (1 + leveraged_return)
+            equity_curve.append(equity)
+        
+        df['equity'] = equity_curve
+        return df
+    
+    def generate_backtest_chart(self):
+        """Generate backtest chart and save as PNG"""
+        try:
+            log.info("Generating backtest chart...")
+            
+            # Get OHLC data
+            ohlc_data = self.get_ohlc_data()
+            if ohlc_data.empty:
+                log.error("No OHLC data available for backtest")
+                return
+            
+            # Get portfolio value for initial capital
+            portfolio_value = self.state["performance"].get("starting_capital", 1000)
+            
+            # Run backtest
+            backtest_df = self.run_backtest(ohlc_data, portfolio_value)
+            
+            # Create figure
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), gridspec_kw={'height_ratios': [3, 1]})
+            
+            # Plot equity curve
+            ax1.plot(backtest_df.index, backtest_df['equity'], color='black', linewidth=1.5, label='Equity')
+            
+            # Color background by signal
+            for i in range(1, len(backtest_df)):
+                signal = backtest_df['signal'].iloc[i]
+                color = 'lightgreen' if signal == 'LONG' else 'lightcoral' if signal == 'SHORT' else 'lightgray'
+                ax1.axvspan(backtest_df.index[i-1], backtest_df.index[i], alpha=0.3, color=color)
+            
+            ax1.set_ylabel('Portfolio Value ($)', fontsize=11)
+            ax1.set_title(f'720-Day Backtest: SMA({SMA_PERIOD_1}/{SMA_PERIOD_2}) + III Dynamic Leverage', fontsize=13, fontweight='bold')
+            ax1.grid(True, alpha=0.3)
+            ax1.legend(loc='upper left')
+            
+            # Format x-axis
+            ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+            ax1.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+            
+            # Plot leverage
+            colors_lev = []
+            for lev in backtest_df['leverage']:
+                if lev == LEV_LOW:
+                    colors_lev.append('orange')
+                elif lev == LEV_MID:
+                    colors_lev.append('green')
+                else:
+                    colors_lev.append('blue')
+            
+            ax2.bar(backtest_df.index, backtest_df['leverage'], color=colors_lev, alpha=0.6, width=1)
+            ax2.set_ylabel('Leverage (x)', fontsize=11)
+            ax2.set_xlabel('Date', fontsize=11)
+            ax2.set_title('Dynamic Leverage (0.5x=Orange, 4.5x=Green, 2.45x=Blue)', fontsize=11)
+            ax2.set_ylim(0, 5)
+            ax2.grid(True, alpha=0.3, axis='y')
+            
+            # Format x-axis
+            ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+            ax2.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+            plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45, ha='right')
+            
+            # Calculate stats
+            final_equity = backtest_df['equity'].iloc[-1]
+            total_return = (final_equity / portfolio_value - 1) * 100
+            
+            # Add stats box
+            stats_text = f"Initial: ${portfolio_value:.2f}\nFinal: ${final_equity:.2f}\nReturn: {total_return:.1f}%"
+            ax1.text(0.02, 0.98, stats_text, transform=ax1.transAxes, fontsize=10,
+                    verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+            
+            plt.tight_layout()
+            plt.savefig(BACKTEST_CHART_PATH, dpi=150, bbox_inches='tight')
+            plt.close()
+            
+            log.info(f"Backtest chart saved to {BACKTEST_CHART_PATH}")
+            
+        except Exception as e:
+            log.error(f"Error generating backtest chart: {e}")
+            import traceback
+            log.error(traceback.format_exc())
 
     def generate_signal(self, current_price: float, sma_1: float, sma_2: float, cross_flag: int, leverage: float) -> str:
         """Generate trading signal based on dual SMA with state machine"""
@@ -296,6 +477,9 @@ class DashboardMonitor:
             self.save_state()
             self.last_update = time.time()
             log.info("Dashboard data updated successfully")
+            
+            # Generate backtest chart
+            self.generate_backtest_chart()
             
         except Exception as e:
             log.error(f"Error updating dashboard data: {e}")
@@ -685,6 +869,14 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
+        <!-- Backtest Chart -->
+        <div class="section">
+            <h2>720-Day Historical Performance</h2>
+            <div style="text-align: center; padding: 20px; background: #f9f9f9; border: 1px solid #e0e0e0;">
+                <img src="/backtest-chart" alt="Backtest Performance Chart" style="max-width: 100%; height: auto; border: 1px solid #ddd;">
+            </div>
+        </div>
+
         <!-- Trade History -->
         <div class="section">
             <h2>Trade Detection Log</h2>
@@ -862,6 +1054,14 @@ def health():
         "last_update": monitor.last_update,
         "data_fresh": monitor.should_update()
     }
+
+@app.route('/backtest-chart')
+def backtest_chart():
+    """Serve the backtest chart image"""
+    if BACKTEST_CHART_PATH.exists():
+        return send_file(str(BACKTEST_CHART_PATH), mimetype='image/png')
+    else:
+        return "Chart not generated yet", 404
 
 @app.route('/force-update')
 def force_update():
