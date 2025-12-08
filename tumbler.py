@@ -34,9 +34,8 @@ INTERVAL_KRAKEN = 1440
 INTERVAL_BINANCE = "1d"
 
 # Strategy Parameters
-SMA_PERIOD_1 = 57   # Primary logic SMA
-SMA_PERIOD_2 = 124  # Filter SMA
-BAND_WIDTH = 0.05   # 5% proximity bands around SMA 1
+SMA_PERIOD_1 = 40   # Primary logic SMA (was 57)
+SMA_PERIOD_2 = 120  # Filter SMA (was 124)
 STATIC_STOP_PCT = 0.02  # 2% static stop loss
 TAKE_PROFIT_PCT = 0.16  # 16% take profit
 LIMIT_OFFSET_PCT = 0.0002  # 0.02% offset for limit orders
@@ -117,11 +116,16 @@ def calculate_smas(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def generate_signal(df: pd.DataFrame, current_price: float, prev_cross_flag: int) -> Tuple[str, float, float, int]:
+def generate_signal(df: pd.DataFrame, current_price: float) -> Tuple[str, float, float]:
     """
-    Generate trading signal using dual SMA strategy with state machine
+    Generate trading signal using dual SMA strategy (simplified backtest logic)
     
-    Returns: (signal, sma_1, sma_2, new_cross_flag)
+    Returns: (signal, sma_1, sma_2)
+    
+    Logic:
+    - LONG: prev_close > SMA1 AND prev_close > SMA2
+    - SHORT: prev_close < SMA1 AND prev_close < SMA2
+    - FLAT: otherwise (contradictory signals)
     """
     df_calc = calculate_smas(df)
     
@@ -129,70 +133,32 @@ def generate_signal(df: pd.DataFrame, current_price: float, prev_cross_flag: int
     sma_1 = df_calc['sma_1'].iloc[-1]
     sma_2 = df_calc['sma_2'].iloc[-1]
     
-    # Get previous close for cross detection
+    # Get previous close for signal generation
     prev_close = df_calc['close'].iloc[-2]
     
     # Check if we have valid values
     if pd.isna(sma_1) or pd.isna(sma_2):
         raise ValueError(f"Not enough historical data for SMA {SMA_PERIOD_1} or SMA {SMA_PERIOD_2}")
     
-    # Calculate proximity bands around SMA 1
-    upper_band = sma_1 * (1 + BAND_WIDTH)
-    lower_band = sma_1 * (1 - BAND_WIDTH)
-    
-    # Update cross flag based on previous close to current price
-    cross_flag = prev_cross_flag
-    
-    # Detect crosses
-    if prev_close < sma_1 and current_price > sma_1:
-        cross_flag = 1  # Just crossed UP
-        log.info("CROSS UP detected through SMA 1")
-    elif prev_close > sma_1 and current_price < sma_1:
-        cross_flag = -1  # Just crossed DOWN
-        log.info("CROSS DOWN detected through SMA 1")
-    
-    # Reset flag if price exits bands
-    if current_price > upper_band or current_price < lower_band:
-        if cross_flag != 0:
-            log.info("Price exited bands - resetting cross flag")
-        cross_flag = 0
-    
-    # Generate base signal from SMA 1 logic
+    # Generate signal based on previous close vs both SMAs
     signal = "FLAT"
     
-    # LONG conditions
-    if current_price > upper_band:
+    if prev_close > sma_1 and prev_close > sma_2:
         signal = "LONG"
-        log.info("LONG: Price above upper band")
-    elif current_price > sma_1 and cross_flag == 1:
-        signal = "LONG"
-        log.info("LONG: Price above SMA1 with recent cross UP")
-    # SHORT conditions
-    elif current_price < lower_band:
+        log.info("LONG: prev_close above both SMAs")
+    elif prev_close < sma_1 and prev_close < sma_2:
         signal = "SHORT"
-        log.info("SHORT: Price below lower band")
-    elif current_price < sma_1 and cross_flag == -1:
-        signal = "SHORT"
-        log.info("SHORT: Price below SMA1 with recent cross DOWN")
-    
-    # Apply SMA 2 filter
-    if signal == "LONG" and current_price < sma_2:
-        log.info("LONG filtered out: price below SMA 2")
-        signal = "FLAT"
-    elif signal == "SHORT" and current_price > sma_2:
-        log.info("SHORT filtered out: price above SMA 2")
-        signal = "FLAT"
+        log.info("SHORT: prev_close below both SMAs")
+    else:
+        log.info("FLAT: contradictory SMA signals")
     
     log.info(f"Current price: ${current_price:.2f}")
     log.info(f"Previous close: ${prev_close:.2f}")
-    log.info(f"SMA 1 (57): ${sma_1:.2f}")
-    log.info(f"SMA 2 (124): ${sma_2:.2f}")
-    log.info(f"Upper band: ${upper_band:.2f}")
-    log.info(f"Lower band: ${lower_band:.2f}")
-    log.info(f"Cross flag: {cross_flag}")
+    log.info(f"SMA 1 (40): ${sma_1:.2f}")
+    log.info(f"SMA 2 (120): ${sma_2:.2f}")
     log.info(f"Final signal: {signal}")
     
-    return signal, sma_1, sma_2, cross_flag
+    return signal, sma_1, sma_2
 
 
 def portfolio_usd(api: kf.KrakenFuturesApi) -> float:
@@ -445,8 +411,7 @@ def load_state() -> Dict:
         "performance": {},
         "current_position": None,
         "current_portfolio_value": 0,
-        "strategy_info": {},
-        "cross_flag": 0
+        "strategy_info": {}
     }
 
 
@@ -481,7 +446,6 @@ def update_state_with_current_position(api: kf.KrakenFuturesApi):
         state["strategy_info"] = {
             "sma_period_1": SMA_PERIOD_1,
             "sma_period_2": SMA_PERIOD_2,
-            "band_width_pct": BAND_WIDTH * 100,
             "stop_loss_pct": STATIC_STOP_PCT * 100,
             "take_profit_pct": TAKE_PROFIT_PCT * 100,
             "iii_window": III_WINDOW,
@@ -490,9 +454,6 @@ def update_state_with_current_position(api: kf.KrakenFuturesApi):
             "limit_offset_pct": LIMIT_OFFSET_PCT * 100,
             "last_updated": datetime.now(timezone.utc).isoformat()
         }
-    
-    if "cross_flag" not in state:
-        state["cross_flag"] = 0
     
     save_state(state)
     log.info(f"Updated state with current position and portfolio value: ${portfolio_value:.2f}")
@@ -526,15 +487,8 @@ def daily_trade(api: kf.KrakenFuturesApi):
     if leverage < 1.0:
         log.info(f"Leverage is {leverage}x - choppy market, reduced position sizing")
     
-    prev_cross_flag = state.get("cross_flag", 0)
-    log.info(f"Previous cross flag: {prev_cross_flag}")
-    
-    signal, sma_1, sma_2, new_cross_flag = generate_signal(df, current_price, prev_cross_flag)
-    
-    # Note: We no longer override signal to FLAT based on leverage
-    # Even with 0.5x leverage, we still take the signal
-    
-    state["cross_flag"] = new_cross_flag
+    # Generate signal (no more cross flag)
+    signal, sma_1, sma_2 = generate_signal(df, current_price)
     
     # Flatten
     log.info("=== STEP 1: Flatten with limit order ===")
@@ -564,7 +518,6 @@ def daily_trade(api: kf.KrakenFuturesApi):
             "portfolio_value": collateral,
             "sma_1": sma_1,
             "sma_2": sma_2,
-            "cross_flag": new_cross_flag,
             "iii": iii,
             "leverage": leverage,
             "stop_distance": 0,
@@ -622,7 +575,6 @@ def daily_trade(api: kf.KrakenFuturesApi):
             "portfolio_value": collateral,
             "sma_1": sma_1,
             "sma_2": sma_2,
-            "cross_flag": new_cross_flag,
             "iii": iii,
             "leverage": leverage,
             "stop_distance": stop_distance,
@@ -645,7 +597,6 @@ def daily_trade(api: kf.KrakenFuturesApi):
     state["strategy_info"] = {
         "sma_period_1": SMA_PERIOD_1,
         "sma_period_2": SMA_PERIOD_2,
-        "band_width_pct": BAND_WIDTH * 100,
         "stop_loss_pct": STATIC_STOP_PCT * 100,
         "take_profit_pct": TAKE_PROFIT_PCT * 100,
         "iii_window": III_WINDOW,
@@ -659,7 +610,6 @@ def daily_trade(api: kf.KrakenFuturesApi):
     
     save_state(state)
     log.info(f"Trade executed and logged. Portfolio: ${collateral:.2f}")
-    log.info(f"New cross flag saved: {new_cross_flag}")
     log.info(f"III: {iii:.4f}, Leverage: {leverage}x")
 
 
