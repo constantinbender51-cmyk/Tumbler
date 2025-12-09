@@ -136,14 +136,15 @@ def check_flat_regime_trigger(iii: float, current_flat_regime: bool) -> bool:
 def check_flat_regime_release(df: pd.DataFrame, current_flat_regime: bool) -> bool:
     """
     Check if we should exit flat regime
-    Release: Price enters 4.5% band around either SMA (using yesterday's data)
+    Release: Price enters 4.5% band around EITHER SMA (using yesterday's data)
+    MATCHES app (7).py logic exactly
     """
     if not current_flat_regime:
         return False
     
     df_calc = calculate_smas(df)
     
-    # Use yesterday's close and SMAs to check bands
+    # Use YESTERDAY's close and YESTERDAY's SMAs to check bands (matching app (7).py)
     prev_close = df_calc['close'].iloc[-2]
     prev_sma_1 = df_calc['sma_1'].iloc[-2]
     prev_sma_2 = df_calc['sma_2'].iloc[-2]
@@ -151,7 +152,7 @@ def check_flat_regime_release(df: pd.DataFrame, current_flat_regime: bool) -> bo
     if pd.isna(prev_sma_1) or pd.isna(prev_sma_2):
         return True  # Release if SMAs not ready
     
-    # Check if price is within BAND_WIDTH_PCT of either SMA
+    # Check if price is within BAND_WIDTH_PCT of EITHER SMA
     diff_sma1 = abs(prev_close - prev_sma_1)
     diff_sma2 = abs(prev_close - prev_sma_2)
     
@@ -163,8 +164,8 @@ def check_flat_regime_release(df: pd.DataFrame, current_flat_regime: bool) -> bo
     
     if in_band_1 or in_band_2:
         log.info(f"RELEASING FLAT REGIME: Price ${prev_close:.2f} entered band")
-        log.info(f"  SMA1: ${prev_sma_1:.2f} (band: ±${thresh_sma1:.2f}), diff: ${diff_sma1:.2f}")
-        log.info(f"  SMA2: ${prev_sma_2:.2f} (band: ±${thresh_sma2:.2f}), diff: ${diff_sma2:.2f}")
+        log.info(f"  Prev SMA1: ${prev_sma_1:.2f} (band: ±${thresh_sma1:.2f}), diff: ${diff_sma1:.2f}")
+        log.info(f"  Prev SMA2: ${prev_sma_2:.2f} (band: ±${thresh_sma2:.2f}), diff: ${diff_sma2:.2f}")
         return False
     
     return True
@@ -173,53 +174,52 @@ def check_flat_regime_release(df: pd.DataFrame, current_flat_regime: bool) -> bo
 def generate_signal(df: pd.DataFrame, current_price: float, is_flat_regime: bool) -> Tuple[str, float, float]:
     """
     Generate trading signal using dual SMA strategy with flat regime override
+    MATCHES app (7).py logic: Uses YESTERDAY's close vs YESTERDAY's SMAs
     
-    Returns: (signal, sma_1, sma_2)
+    Returns: (signal, prev_sma_1, prev_sma_2)
     
     Logic:
     - If in flat regime: FLAT (no position)
     - Otherwise:
-      - LONG: prev_close > SMA1 AND prev_close > SMA2
-      - SHORT: prev_close < SMA1 AND prev_close < SMA2
+      - LONG: prev_close > prev_SMA1 AND prev_close > prev_SMA2
+      - SHORT: prev_close < prev_SMA1 AND prev_close < prev_SMA2
       - FLAT: contradictory signals
     """
     df_calc = calculate_smas(df)
     
-    # Get latest values
-    sma_1 = df_calc['sma_1'].iloc[-1]
-    sma_2 = df_calc['sma_2'].iloc[-1]
-    
-    # Get previous close for signal generation
+    # Get YESTERDAY's values for signal generation (matching app (7).py)
     prev_close = df_calc['close'].iloc[-2]
+    prev_sma_1 = df_calc['sma_1'].iloc[-2]
+    prev_sma_2 = df_calc['sma_2'].iloc[-2]
     
     # Check if we have valid values
-    if pd.isna(sma_1) or pd.isna(sma_2):
+    if pd.isna(prev_sma_1) or pd.isna(prev_sma_2):
         raise ValueError(f"Not enough historical data for SMA {SMA_PERIOD_1} or SMA {SMA_PERIOD_2}")
     
     # FLAT REGIME OVERRIDE
     if is_flat_regime:
         log.info("FLAT REGIME ACTIVE: Forcing FLAT signal (no position)")
-        return "FLAT", sma_1, sma_2
+        return "FLAT", prev_sma_1, prev_sma_2
     
-    # Generate signal based on previous close vs both SMAs
+    # Generate signal based on YESTERDAY's close vs YESTERDAY's SMAs
     signal = "FLAT"
     
-    if prev_close > sma_1 and prev_close > sma_2:
+    if prev_close > prev_sma_1 and prev_close > prev_sma_2:
         signal = "LONG"
-        log.info("LONG: prev_close above both SMAs")
-    elif prev_close < sma_1 and prev_close < sma_2:
+        log.info("LONG: prev_close above both prev_SMAs")
+    elif prev_close < prev_sma_1 and prev_close < prev_sma_2:
         signal = "SHORT"
-        log.info("SHORT: prev_close below both SMAs")
+        log.info("SHORT: prev_close below both prev_SMAs")
     else:
         log.info("FLAT: contradictory SMA signals")
     
     log.info(f"Current price: ${current_price:.2f}")
     log.info(f"Previous close: ${prev_close:.2f}")
-    log.info(f"SMA 1 (40): ${sma_1:.2f}")
-    log.info(f"SMA 2 (120): ${sma_2:.2f}")
+    log.info(f"Previous SMA 1 (40): ${prev_sma_1:.2f}")
+    log.info(f"Previous SMA 2 (120): ${prev_sma_2:.2f}")
     log.info(f"Final signal: {signal}")
     
-    return signal, sma_1, sma_2
+    return signal, prev_sma_1, prev_sma_2
 
 
 def portfolio_usd(api: kf.KrakenFuturesApi) -> float:
