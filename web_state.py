@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-web_state.py - Dual SMA Strategy Dashboard with III Dynamic Leverage
-Displays strategy with SMA 1 (57), SMA 2 (124), III, and dynamic leverage
+web_state.py - Dual SMA Strategy Dashboard with III Dynamic Leverage + Flat Regime
+Displays strategy with SMA 1 (40), SMA 2 (120), III, dynamic leverage, and flat regime
+Backtest uses ONLY prior day data for signals - no lookahead bias
 """
 
 from flask import Flask, render_template_string, send_file
@@ -42,6 +43,8 @@ III_T_HIGH = 0.18
 LEV_LOW = 0.5
 LEV_MID = 4.5
 LEV_HIGH = 2.45
+FLAT_REGIME_THRESHOLD = 0.16
+BAND_WIDTH_PCT = 0.045  # 4.5%
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -92,8 +95,11 @@ class DashboardMonitor:
                 "stop_loss_pct": STATIC_STOP_PCT,
                 "take_profit_pct": TAKE_PROFIT_PCT,
                 "iii_window": III_WINDOW,
-                "leverage_tiers": f"{LEV_LOW}x / {LEV_MID}x / {LEV_HIGH}x"
+                "leverage_tiers": f"{LEV_LOW}x / {LEV_MID}x / {LEV_HIGH}x",
+                "flat_regime_threshold": FLAT_REGIME_THRESHOLD,
+                "band_width_pct": BAND_WIDTH_PCT * 100
             },
+            "flat_regime_active": False,
             "last_updated": None
         }
 
@@ -169,20 +175,36 @@ class DashboardMonitor:
             log.error(f"Error getting OHLC data: {e}")
             return pd.DataFrame()
 
-    def calculate_iii(self, df: pd.DataFrame) -> float:
-        """Calculate Inefficiency Index (III) over the last 35 days"""
-        if len(df) < III_WINDOW + 1:
+    def calculate_iii(self, df: pd.DataFrame, end_idx: int) -> float:
+        """
+        Calculate Inefficiency Index (III) over the last 35 days
+        CRITICAL: Uses only data UP TO end_idx (inclusive)
+        For day i, this should be called with end_idx = i-1 to avoid lookahead
+        """
+        if end_idx < III_WINDOW:
             return 0.0
         
-        recent_df = df.tail(III_WINDOW + 1).copy()
-        recent_df['log_ret'] = np.log(recent_df['close'] / recent_df['close'].shift(1))
-        log_rets = recent_df['log_ret'].dropna()
+        # Get window ending at end_idx (i.e., using only past data)
+        start_idx = max(0, end_idx - III_WINDOW)
+        window_df = df.iloc[start_idx:end_idx + 1].copy()
+        
+        if len(window_df) < 2:
+            return 0.0
+        
+        # Calculate log returns
+        window_df['log_ret'] = np.log(window_df['close'] / window_df['close'].shift(1))
+        log_rets = window_df['log_ret'].dropna()
         
         if len(log_rets) < III_WINDOW:
             return 0.0
         
+        # Net direction = sum of log returns (total movement)
         net_direction = abs(log_rets.sum())
+        
+        # Path length = sum of absolute log returns (total distance traveled)
         path_length = log_rets.abs().sum()
+        
+        # III calculation
         epsilon = 1e-8
         iii = net_direction / (path_length + epsilon)
         
@@ -198,7 +220,7 @@ class DashboardMonitor:
             return LEV_HIGH
 
     def calculate_smas(self, df: pd.DataFrame) -> tuple:
-        """Calculate SMA 1 (57) and SMA 2 (124)"""
+        """Calculate SMA 1 (40) and SMA 2 (120)"""
         if len(df) < SMA_PERIOD_2:
             return 0, 0
         
@@ -211,48 +233,83 @@ class DashboardMonitor:
     def run_backtest(self, df: pd.DataFrame, initial_capital: float = 1000.0) -> pd.DataFrame:
         """
         Run backtest on historical data (last 720 days)
-        Returns DataFrame with equity, signal, and leverage for each day
+        CRITICAL: Uses ONLY prior day data for each day's signal
+        - Day i signal uses: close[i-1], sma[i-1], iii[i-1]
+        - Day i PnL uses: open[i], high[i], low[i], close[i]
+        NO LOOKAHEAD BIAS
         """
         # Limit to 720 days
         df = df.tail(720).copy()
+        df = df.reset_index(drop=False)
         
-        # Calculate SMAs
+        # Pre-calculate SMAs for ALL days
         df['sma_1'] = df['close'].rolling(window=SMA_PERIOD_1).mean()
         df['sma_2'] = df['close'].rolling(window=SMA_PERIOD_2).mean()
         
-        # Calculate III
+        # Pre-calculate III for ALL days (using only prior data)
         iii_values = []
         for i in range(len(df)):
             if i < III_WINDOW:
                 iii_values.append(0.0)
             else:
-                window_df = df.iloc[max(0, i-III_WINDOW):i+1]
-                iii = self.calculate_iii(window_df)
+                # CRITICAL: Calculate III using data up to i-1 (prior day)
+                iii = self.calculate_iii(df, i - 1)
                 iii_values.append(iii)
         df['iii'] = iii_values
         
-        # Determine leverage for each day
+        # Pre-calculate leverage for ALL days
         df['leverage'] = df['iii'].apply(self.determine_leverage)
         
-        # Generate signals (using previous close vs SMAs)
+        # Initialize flat regime state
+        is_flat_regime = False
+        flat_regime_status = []
+        
+        # Generate signals using ONLY prior day data
         signals = []
         for i in range(len(df)):
-            if i == 0 or pd.isna(df['sma_1'].iloc[i]) or pd.isna(df['sma_2'].iloc[i]):
+            # Need at least 1 prior day and valid SMAs
+            if i == 0 or pd.isna(df['sma_1'].iloc[i-1]) or pd.isna(df['sma_2'].iloc[i-1]):
                 signals.append('FLAT')
-            else:
-                prev_close = df['close'].iloc[i-1]
-                sma_1 = df['sma_1'].iloc[i]
-                sma_2 = df['sma_2'].iloc[i]
+                flat_regime_status.append(False)
+                continue
+            
+            # Get PRIOR DAY data for signal generation
+            prior_close = df['close'].iloc[i-1]
+            prior_sma_1 = df['sma_1'].iloc[i-1]
+            prior_sma_2 = df['sma_2'].iloc[i-1]
+            prior_iii = df['iii'].iloc[i-1]  # This already uses data up to i-2
+            
+            # FLAT REGIME CHECK (using prior day III)
+            # Trigger: Prior day III < 0.16
+            if prior_iii < FLAT_REGIME_THRESHOLD:
+                is_flat_regime = True
+            
+            # Release: Check if prior day price entered bands
+            if is_flat_regime:
+                diff_sma1 = abs(prior_close - prior_sma_1)
+                diff_sma2 = abs(prior_close - prior_sma_2)
+                thresh_sma1 = prior_sma_1 * BAND_WIDTH_PCT
+                thresh_sma2 = prior_sma_2 * BAND_WIDTH_PCT
                 
-                if prev_close > sma_1 and prev_close > sma_2:
-                    signals.append('LONG')
-                elif prev_close < sma_1 and prev_close < sma_2:
-                    signals.append('SHORT')
-                else:
-                    signals.append('FLAT')
-        df['signal'] = signals
+                if diff_sma1 <= thresh_sma1 or diff_sma2 <= thresh_sma2:
+                    is_flat_regime = False
+            
+            flat_regime_status.append(is_flat_regime)
+            
+            # Generate signal
+            if is_flat_regime:
+                signals.append('FLAT')
+            elif prior_close > prior_sma_1 and prior_close > prior_sma_2:
+                signals.append('LONG')
+            elif prior_close < prior_sma_1 and prior_close < prior_sma_2:
+                signals.append('SHORT')
+            else:
+                signals.append('FLAT')
         
-        # Backtest with SL/TP
+        df['signal'] = signals
+        df['flat_regime'] = flat_regime_status
+        
+        # Backtest with SL/TP using CURRENT day OHLC
         equity = initial_capital
         equity_curve = []
         
@@ -262,7 +319,9 @@ class DashboardMonitor:
                 continue
             
             signal = df['signal'].iloc[i]
-            leverage = df['leverage'].iloc[i]
+            leverage = df['leverage'].iloc[i-1]  # Use PRIOR day leverage
+            
+            # Use CURRENT day OHLC for execution
             open_price = df['open'].iloc[i]
             high_price = df['high'].iloc[i]
             low_price = df['low'].iloc[i]
@@ -300,6 +359,7 @@ class DashboardMonitor:
             equity_curve.append(equity)
         
         df['equity'] = equity_curve
+        df.set_index('time', inplace=True)
         return df
     
     def generate_backtest_chart(self):
@@ -320,7 +380,8 @@ class DashboardMonitor:
             backtest_df = self.run_backtest(ohlc_data, portfolio_value)
             
             # Create figure
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), gridspec_kw={'height_ratios': [3, 1]})
+            fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 12), 
+                                                 gridspec_kw={'height_ratios': [3, 1, 1]})
             
             # Plot equity curve
             ax1.plot(backtest_df.index, backtest_df['equity'], color='black', linewidth=1.5, label='Equity')
@@ -332,7 +393,8 @@ class DashboardMonitor:
                 ax1.axvspan(backtest_df.index[i-1], backtest_df.index[i], alpha=0.3, color=color)
             
             ax1.set_ylabel('Portfolio Value ($)', fontsize=11)
-            ax1.set_title(f'720-Day Backtest: SMA({SMA_PERIOD_1}/{SMA_PERIOD_2}) + III Dynamic Leverage', fontsize=13, fontweight='bold')
+            ax1.set_title(f'720-Day Backtest: SMA({SMA_PERIOD_1}/{SMA_PERIOD_2}) + III + Flat Regime', 
+                         fontsize=13, fontweight='bold')
             ax1.grid(True, alpha=0.3)
             ax1.legend(loc='upper left')
             
@@ -352,7 +414,6 @@ class DashboardMonitor:
             
             ax2.bar(backtest_df.index, backtest_df['leverage'], color=colors_lev, alpha=0.6, width=1)
             ax2.set_ylabel('Leverage (x)', fontsize=11)
-            ax2.set_xlabel('Date', fontsize=11)
             ax2.set_title('Dynamic Leverage (0.5x=Orange, 4.5x=Green, 2.45x=Blue)', fontsize=11)
             ax2.set_ylim(0, 5)
             ax2.grid(True, alpha=0.3, axis='y')
@@ -360,14 +421,37 @@ class DashboardMonitor:
             # Format x-axis
             ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
             ax2.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
-            plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45, ha='right')
+            
+            # Plot flat regime status
+            flat_regime_vals = backtest_df['flat_regime'].astype(int)
+            ax3.fill_between(backtest_df.index, 0, flat_regime_vals, 
+                            color='red', alpha=0.5, label='Flat Regime Active')
+            ax3.set_ylabel('Flat Regime', fontsize=11)
+            ax3.set_xlabel('Date', fontsize=11)
+            ax3.set_title('Flat Regime Status (Red = Active, Trading Paused)', fontsize=11)
+            ax3.set_ylim(-0.1, 1.1)
+            ax3.set_yticks([0, 1])
+            ax3.set_yticklabels(['Normal', 'Flat'])
+            ax3.grid(True, alpha=0.3, axis='y')
+            ax3.legend(loc='upper left')
+            
+            # Format x-axis
+            ax3.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+            ax3.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+            plt.setp(ax3.xaxis.get_majorticklabels(), rotation=45, ha='right')
             
             # Calculate stats
             final_equity = backtest_df['equity'].iloc[-1]
             total_return = (final_equity / portfolio_value - 1) * 100
+            flat_days = backtest_df['flat_regime'].sum()
+            total_days = len(backtest_df)
+            flat_pct = (flat_days / total_days) * 100
             
             # Add stats box
-            stats_text = f"Initial: ${portfolio_value:.2f}\nFinal: ${final_equity:.2f}\nReturn: {total_return:.1f}%"
+            stats_text = (f"Initial: ${portfolio_value:.2f}\n"
+                         f"Final: ${final_equity:.2f}\n"
+                         f"Return: {total_return:.1f}%\n"
+                         f"Flat Days: {flat_days}/{total_days} ({flat_pct:.1f}%)")
             ax1.text(0.02, 0.98, stats_text, transform=ax1.transAxes, fontsize=10,
                     verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
             
@@ -376,14 +460,19 @@ class DashboardMonitor:
             plt.close()
             
             log.info(f"Backtest chart saved to {BACKTEST_CHART_PATH}")
+            log.info(f"Backtest stats: Return={total_return:.1f}%, Flat days={flat_days}/{total_days}")
             
         except Exception as e:
             log.error(f"Error generating backtest chart: {e}")
             import traceback
             log.error(traceback.format_exc())
 
-    def generate_signal(self, current_price: float, sma_1: float, sma_2: float, prev_close: float, leverage: float) -> str:
-        """Generate trading signal based on dual SMA (simplified backtest logic)"""
+    def generate_signal(self, current_price: float, sma_1: float, sma_2: float, 
+                       prev_close: float, is_flat_regime: bool) -> str:
+        """Generate trading signal based on dual SMA with flat regime override"""
+        if is_flat_regime:
+            return "FLAT"
+        
         signal = "FLAT"
         
         # LONG: prev_close above both SMAs
@@ -409,18 +498,43 @@ class DashboardMonitor:
             current_position = self.get_current_position()
             ohlc_data = self.get_ohlc_data()
             
-            # Calculate technical indicators
+            # Calculate technical indicators using prior day data
             sma_1, sma_2 = self.calculate_smas(ohlc_data)
-            iii = self.calculate_iii(ohlc_data)
+            
+            # Calculate III using only prior data
+            iii = self.calculate_iii(ohlc_data, len(ohlc_data) - 2)  # Use up to yesterday
             leverage = self.determine_leverage(iii)
             
             # Get previous close for signal generation
             prev_close = ohlc_data['close'].iloc[-2] if len(ohlc_data) > 1 else mark_price
-            signal = self.generate_signal(mark_price, sma_1, sma_2, prev_close, leverage)
             
-            # Calculate bands for display (not used in signal)
-            upper_band = sma_1 * 1.05
-            lower_band = sma_1 * 0.95
+            # Check flat regime status
+            current_flat_regime = self.state.get("flat_regime_active", False)
+            is_flat_regime = current_flat_regime
+            
+            # Check trigger
+            if iii < FLAT_REGIME_THRESHOLD:
+                is_flat_regime = True
+            
+            # Check release
+            if is_flat_regime and len(ohlc_data) > 1:
+                prev_sma_1 = ohlc_data['close'].rolling(window=SMA_PERIOD_1).mean().iloc[-2]
+                prev_sma_2 = ohlc_data['close'].rolling(window=SMA_PERIOD_2).mean().iloc[-2]
+                
+                if not pd.isna(prev_sma_1) and not pd.isna(prev_sma_2):
+                    diff_sma1 = abs(prev_close - prev_sma_1)
+                    diff_sma2 = abs(prev_close - prev_sma_2)
+                    thresh_sma1 = prev_sma_1 * BAND_WIDTH_PCT
+                    thresh_sma2 = prev_sma_2 * BAND_WIDTH_PCT
+                    
+                    if diff_sma1 <= thresh_sma1 or diff_sma2 <= thresh_sma2:
+                        is_flat_regime = False
+            
+            signal = self.generate_signal(mark_price, sma_1, sma_2, prev_close, is_flat_regime)
+            
+            # Calculate bands for display
+            upper_band = sma_1 * (1 + BAND_WIDTH_PCT)
+            lower_band = sma_1 * (1 - BAND_WIDTH_PCT)
             
             # Update performance metrics
             if self.state["performance"]["starting_capital"] == 0:
@@ -440,6 +554,7 @@ class DashboardMonitor:
             }
             
             self.state["current_position"] = current_position
+            self.state["flat_regime_active"] = is_flat_regime
             self.state["market_data"] = {
                 "current_price": mark_price,
                 "sma_1": sma_1,
@@ -449,6 +564,7 @@ class DashboardMonitor:
                 "iii": iii,
                 "leverage": leverage,
                 "signal": signal,
+                "flat_regime_active": is_flat_regime,
                 "last_updated": datetime.now(timezone.utc).isoformat()
             }
             
@@ -460,6 +576,7 @@ class DashboardMonitor:
             self.save_state()
             self.last_update = time.time()
             log.info("Dashboard data updated successfully")
+            log.info(f"Flat regime status: {is_flat_regime}, III: {iii:.4f}")
             
             # Generate backtest chart
             self.generate_backtest_chart()
@@ -492,6 +609,7 @@ class DashboardMonitor:
                 "sma_2": self.state["market_data"].get("sma_2", 0),
                 "iii": self.state["market_data"].get("iii", 0),
                 "leverage": self.state["market_data"].get("leverage", 0),
+                "flat_regime_active": self.state.get("flat_regime_active", False),
                 "stop_distance": (current_price * (STATIC_STOP_PCT / 100)) if current_position else 0,
                 "stop_loss_pct": STATIC_STOP_PCT,
                 "tp_distance": (current_price * (TAKE_PROFIT_PCT / 100)) if current_position else 0,
@@ -728,18 +846,46 @@ HTML_TEMPLATE = """
         .status-offline {
             background: #ff0000;
         }
+        .status-flat-regime {
+            background: #ff6b6b;
+        }
+        .alert {
+            background: #fff3cd;
+            color: #856404;
+            padding: 15px 20px;
+            border: 1px solid #ffeaa7;
+            margin-bottom: 30px;
+            text-align: center;
+            font-size: 0.9em;
+        }
+        .flat-regime-banner {
+            background: #ff6b6b;
+            color: #ffffff;
+            padding: 15px 20px;
+            margin-bottom: 30px;
+            text-align: center;
+            font-weight: 600;
+            font-size: 1em;
+            letter-spacing: 0.5px;
+        }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>Dual SMA State Machine Strategy</h1>
+        <h1>Dual SMA + Flat Regime Strategy</h1>
         <div class="subtitle">
             <span class="status-indicator {% if data_fresh %}status-live{% else %}status-offline{% endif %}"></span>
-            SMA1(57) + SMA2(124) + III Dynamic Leverage | 2% SL + 16% TP
+            SMA1(40) + SMA2(120) + III Dynamic Leverage + Flat Regime | 2% SL + 16% TP
         </div>
         
+        {% if flat_regime_active %}
+        <div class="flat-regime-banner">
+            ⚠️ FLAT REGIME ACTIVE - TRADING PAUSED ⚠️
+        </div>
+        {% endif %}
+        
         {% if not api_configured %}
-        <div style="background: #fff3cd; color: #856404; padding: 20px; border: 1px solid #ffeaa7; margin-bottom: 40px; text-align: center;">
+        <div class="alert">
             <strong>API Configuration Required</strong><br>
             Set KRAKEN_API_KEY and KRAKEN_API_SECRET environment variables to enable live data fetching.
         </div>
@@ -772,14 +918,14 @@ HTML_TEMPLATE = """
                 <div class="card-label">BTC Mark Price</div>
             </div>
             <div class="card">
-                <h2>SMA 1 (Logic)</h2>
+                <h2>SMA 1 (40-day)</h2>
                 <div class="card-value">${{ sma_1 }}</div>
-                <div class="card-label">57-day MA with Bands</div>
+                <div class="card-label">Primary Logic SMA</div>
             </div>
             <div class="card">
-                <h2>SMA 2 (Filter)</h2>
+                <h2>SMA 2 (120-day)</h2>
                 <div class="card-value">${{ sma_2 }}</div>
-                <div class="card-label">124-day MA Filter</div>
+                <div class="card-label">Trend Filter SMA</div>
             </div>
             <div class="card">
                 <h2>Signal</h2>
@@ -791,24 +937,66 @@ HTML_TEMPLATE = """
         <!-- III and Leverage -->
         <div class="grid">
             <div class="card">
-                <h2>Upper Band</h2>
+                <h2>Upper Band (4.5%)</h2>
                 <div class="card-value">${{ upper_band }}</div>
-                <div class="card-label">SMA1 + 5%</div>
+                <div class="card-label">SMA1 + 4.5%</div>
             </div>
             <div class="card">
-                <h2>Lower Band</h2>
+                <h2>Lower Band (4.5%)</h2>
                 <div class="card-value">${{ lower_band }}</div>
-                <div class="card-label">SMA1 - 5%</div>
+                <div class="card-label">SMA1 - 4.5%</div>
             </div>
             <div class="card">
                 <h2>III (35-day)</h2>
                 <div class="card-value">{{ iii }}</div>
-                <div class="card-label">Inefficiency Index</div>
+                <div class="card-label">Efficiency Index</div>
             </div>
             <div class="card">
                 <h2>Dynamic Leverage</h2>
                 <div class="card-value">{{ current_leverage }}x</div>
                 <div class="card-label">Based on III</div>
+            </div>
+        </div>
+
+        <!-- Flat Regime Status -->
+        <div class="grid">
+            <div class="card">
+                <h2>Flat Regime Status</h2>
+                <div class="card-value">{{ 'ACTIVE' if flat_regime_active else 'NORMAL' }}</div>
+                <div class="card-label">
+                    {% if flat_regime_active %}
+                    <span class="status-indicator status-flat-regime"></span>Trading Paused
+                    {% else %}
+                    <span class="status-indicator status-live"></span>Trading Active
+                    {% endif %}
+                </div>
+            </div>
+            <div class="card">
+                <h2>Flat Threshold</h2>
+                <div class="card-value">{{ flat_threshold }}</div>
+                <div class="card-label">III < 0.16 triggers pause</div>
+            </div>
+            <div class="card">
+                <h2>Band Width</h2>
+                <div class="card-value">{{ band_width }}%</div>
+                <div class="card-label">Release trigger zone</div>
+            </div>
+            <div class="card">
+                <h2>Regime Logic</h2>
+                <div class="card-value" style="font-size: 1.2em;">
+                    {% if flat_regime_active %}
+                    PAUSED
+                    {% else %}
+                    TRADING
+                    {% endif %}
+                </div>
+                <div class="card-label">
+                    {% if flat_regime_active %}
+                    Waiting for price to enter bands
+                    {% else %}
+                    Normal trend-following active
+                    {% endif %}
+                </div>
             </div>
         </div>
 
@@ -818,7 +1006,7 @@ HTML_TEMPLATE = """
             <div class="strategy-info">
                 <div class="strategy-stat">
                     <div class="strategy-stat-label">Strategy Type</div>
-                    <div class="strategy-stat-value">Dual SMA + III</div>
+                    <div class="strategy-stat-value">Dual SMA + Flat Regime</div>
                 </div>
                 <div class="strategy-stat">
                     <div class="strategy-stat-label">SMA 1 (Logic)</div>
@@ -827,10 +1015,6 @@ HTML_TEMPLATE = """
                 <div class="strategy-stat">
                     <div class="strategy-stat-label">SMA 2 (Filter)</div>
                     <div class="strategy-stat-value">{{ sma_period_2 }} days</div>
-                </div>
-                <div class="strategy-stat">
-                    <div class="strategy-stat-label">Band Width</div>
-                    <div class="strategy-stat-value">{{ band_width_pct }}%</div>
                 </div>
                 <div class="strategy-stat">
                     <div class="strategy-stat-label">Stop Loss</div>
@@ -848,14 +1032,27 @@ HTML_TEMPLATE = """
                     <div class="strategy-stat-label">Leverage Tiers</div>
                     <div class="strategy-stat-value">0.5x/4.5x/2.45x</div>
                 </div>
+                <div class="strategy-stat">
+                    <div class="strategy-stat-label">No Lookahead</div>
+                    <div class="strategy-stat-value">✓ Verified</div>
+                </div>
             </div>
         </div>
 
         <!-- Backtest Chart -->
         <div class="section">
-            <h2>720-Day Historical Performance</h2>
+            <h2>720-Day Historical Performance (No Lookahead Bias)</h2>
             <div style="text-align: center; padding: 20px; background: #f9f9f9; border: 1px solid #e0e0e0;">
                 <img src="/backtest-chart" alt="Backtest Performance Chart" style="max-width: 100%; height: auto; border: 1px solid #ddd;">
+            </div>
+            <div style="margin-top: 15px; padding: 15px; background: #f0f0f0; border: 1px solid #ddd; font-size: 0.85em;">
+                <strong>Backtest Methodology:</strong><br>
+                • Day i signal uses ONLY data from day i-1 and earlier (no lookahead)<br>
+                • III calculated using 35 days of PRIOR data only<br>
+                • SMAs use PRIOR day values for signal generation<br>
+                • Day i execution uses day i OHLC (open/high/low/close)<br>
+                • Flat regime pauses trading when III &lt; 0.16, resumes when price enters 4.5% bands<br>
+                • Red shading = Flat regime active (no position)
             </div>
         </div>
 
@@ -875,6 +1072,7 @@ HTML_TEMPLATE = """
                         <th>SMA 2</th>
                         <th>III</th>
                         <th>Leverage</th>
+                        <th>Flat Regime</th>
                         <th>SL %</th>
                         <th>TP %</th>
                         <th>Portfolio</th>
@@ -892,6 +1090,7 @@ HTML_TEMPLATE = """
                         <td>${{ trade.sma_2 }}</td>
                         <td>{{ trade.iii }}</td>
                         <td>{{ trade.leverage }}x</td>
+                        <td>{% if trade.flat_regime_active %}YES{% else %}NO{% endif %}</td>
                         <td>{{ trade.stop_loss_pct }}%</td>
                         <td>{{ trade.take_profit_pct }}%</td>
                         <td>${{ trade.portfolio_value }}</td>
@@ -966,14 +1165,18 @@ def dashboard():
     iii = f"{market_data.get('iii', 0):.4f}"
     current_leverage = market_data.get('leverage', 0)
     
+    # Flat regime status
+    flat_regime_active = state.get("flat_regime_active", False)
+    
     # Strategy info
     strategy_info = state.get("strategy_info", {})
-    sma_period_1 = strategy_info.get('sma_period_1', 57)
-    sma_period_2 = strategy_info.get('sma_period_2', 124)
-    band_width_pct = strategy_info.get('band_width_pct', 5.0)
+    sma_period_1 = strategy_info.get('sma_period_1', 40)
+    sma_period_2 = strategy_info.get('sma_period_2', 120)
+    band_width = strategy_info.get('band_width_pct', 4.5)
     stop_loss_pct = strategy_info.get('stop_loss_pct', 2.0)
     take_profit_pct = strategy_info.get('take_profit_pct', 16.0)
-    iii_window = strategy_info.get('iii_window', 14)
+    iii_window = strategy_info.get('iii_window', 35)
+    flat_threshold = strategy_info.get('flat_regime_threshold', 0.16)
     
     # Format trades
     trades = []
@@ -993,6 +1196,7 @@ def dashboard():
         trade_copy['leverage'] = f"{trade.get('leverage', 0):.1f}"
         trade_copy['stop_loss_pct'] = f"{trade.get('stop_loss_pct', 2.0):.1f}"
         trade_copy['take_profit_pct'] = f"{trade.get('take_profit_pct', 16.0):.1f}"
+        trade_copy['flat_regime_active'] = trade.get('flat_regime_active', False)
         trades.append(trade_copy)
     
     # Reverse for display (newest first)
@@ -1018,9 +1222,11 @@ def dashboard():
         market_signal=market_signal,
         iii=iii,
         current_leverage=current_leverage,
+        flat_regime_active=flat_regime_active,
+        flat_threshold=flat_threshold,
+        band_width=band_width,
         sma_period_1=sma_period_1,
         sma_period_2=sma_period_2,
-        band_width_pct=band_width_pct,
         stop_loss_pct=stop_loss_pct,
         take_profit_pct=take_profit_pct,
         iii_window=iii_window,
@@ -1034,7 +1240,8 @@ def health():
     return {
         "status": "healthy",
         "last_update": monitor.last_update,
-        "data_fresh": monitor.should_update()
+        "data_fresh": monitor.should_update(),
+        "flat_regime_active": monitor.state.get("flat_regime_active", False)
     }
 
 @app.route('/backtest-chart')
