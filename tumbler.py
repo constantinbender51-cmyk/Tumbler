@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-tumbler.py - Dual SMA Strategy with State Machine + III Dynamic Leverage
-SMA 1 (57 days): Primary logic with proximity bands and cross detection
-SMA 2 (124 days): Hard trend filter
-III-Based Leverage: 0x (choppy) / 3x (trending) / 1.5x (overextended)
+tumbler.py - Dual SMA Strategy with Flat Regime Detection + III Dynamic Leverage
+SMA 1 (40 days): Primary logic with proximity bands and cross detection
+SMA 2 (120 days): Hard trend filter
+III-Based Leverage: 0.5x (choppy) / 4.5x (trending) / 2.45x (overextended)
+Flat Regime: Pauses trading when III < 0.16, resumes when price enters 4.5% bands
 Trades daily at 00:01 UTC with 2% SL + 16% TP
 """
 
@@ -34,8 +35,8 @@ INTERVAL_KRAKEN = 1440
 INTERVAL_BINANCE = "1d"
 
 # Strategy Parameters
-SMA_PERIOD_1 = 40   # Primary logic SMA (was 57)
-SMA_PERIOD_2 = 120  # Filter SMA (was 124)
+SMA_PERIOD_1 = 40   # Primary logic SMA
+SMA_PERIOD_2 = 120  # Filter SMA
 STATIC_STOP_PCT = 0.02  # 2% static stop loss
 TAKE_PROFIT_PCT = 0.16  # 16% take profit
 LIMIT_OFFSET_PCT = 0.0002  # 0.02% offset for limit orders
@@ -48,6 +49,10 @@ III_T_HIGH = 0.18  # Above this: 2.45x leverage (overextended)
 LEV_LOW = 0.5   # Choppy market
 LEV_MID = 4.5   # Trending market
 LEV_HIGH = 2.45  # Overextended market
+
+# Flat Regime Parameters
+FLAT_REGIME_THRESHOLD = 0.16  # III below this triggers flat regime
+BAND_WIDTH_PCT = 0.045  # 4.5% bandwidth for regime release
 
 STATE_FILE = Path("sma_state.json")
 
@@ -109,23 +114,74 @@ def determine_leverage(iii: float) -> float:
 
 
 def calculate_smas(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculate SMA 1 (57) and SMA 2 (124)"""
+    """Calculate SMA 1 (40) and SMA 2 (120)"""
     df = df.copy()
     df['sma_1'] = df['close'].rolling(window=SMA_PERIOD_1).mean()
     df['sma_2'] = df['close'].rolling(window=SMA_PERIOD_2).mean()
     return df
 
 
-def generate_signal(df: pd.DataFrame, current_price: float) -> Tuple[str, float, float]:
+def check_flat_regime_trigger(iii: float, current_flat_regime: bool) -> bool:
     """
-    Generate trading signal using dual SMA strategy (simplified backtest logic)
+    Check if we should enter flat regime
+    Trigger: III < 0.16
+    """
+    if iii < FLAT_REGIME_THRESHOLD:
+        if not current_flat_regime:
+            log.info(f"ENTERING FLAT REGIME: III={iii:.4f} < {FLAT_REGIME_THRESHOLD}")
+        return True
+    return current_flat_regime
+
+
+def check_flat_regime_release(df: pd.DataFrame, current_flat_regime: bool) -> bool:
+    """
+    Check if we should exit flat regime
+    Release: Price enters 4.5% band around either SMA (using yesterday's data)
+    """
+    if not current_flat_regime:
+        return False
+    
+    df_calc = calculate_smas(df)
+    
+    # Use yesterday's close and SMAs to check bands
+    prev_close = df_calc['close'].iloc[-2]
+    prev_sma_1 = df_calc['sma_1'].iloc[-2]
+    prev_sma_2 = df_calc['sma_2'].iloc[-2]
+    
+    if pd.isna(prev_sma_1) or pd.isna(prev_sma_2):
+        return True  # Release if SMAs not ready
+    
+    # Check if price is within BAND_WIDTH_PCT of either SMA
+    diff_sma1 = abs(prev_close - prev_sma_1)
+    diff_sma2 = abs(prev_close - prev_sma_2)
+    
+    thresh_sma1 = prev_sma_1 * BAND_WIDTH_PCT
+    thresh_sma2 = prev_sma_2 * BAND_WIDTH_PCT
+    
+    in_band_1 = diff_sma1 <= thresh_sma1
+    in_band_2 = diff_sma2 <= thresh_sma2
+    
+    if in_band_1 or in_band_2:
+        log.info(f"RELEASING FLAT REGIME: Price ${prev_close:.2f} entered band")
+        log.info(f"  SMA1: ${prev_sma_1:.2f} (band: ±${thresh_sma1:.2f}), diff: ${diff_sma1:.2f}")
+        log.info(f"  SMA2: ${prev_sma_2:.2f} (band: ±${thresh_sma2:.2f}), diff: ${diff_sma2:.2f}")
+        return False
+    
+    return True
+
+
+def generate_signal(df: pd.DataFrame, current_price: float, is_flat_regime: bool) -> Tuple[str, float, float]:
+    """
+    Generate trading signal using dual SMA strategy with flat regime override
     
     Returns: (signal, sma_1, sma_2)
     
     Logic:
-    - LONG: prev_close > SMA1 AND prev_close > SMA2
-    - SHORT: prev_close < SMA1 AND prev_close < SMA2
-    - FLAT: otherwise (contradictory signals)
+    - If in flat regime: FLAT (no position)
+    - Otherwise:
+      - LONG: prev_close > SMA1 AND prev_close > SMA2
+      - SHORT: prev_close < SMA1 AND prev_close < SMA2
+      - FLAT: contradictory signals
     """
     df_calc = calculate_smas(df)
     
@@ -139,6 +195,11 @@ def generate_signal(df: pd.DataFrame, current_price: float) -> Tuple[str, float,
     # Check if we have valid values
     if pd.isna(sma_1) or pd.isna(sma_2):
         raise ValueError(f"Not enough historical data for SMA {SMA_PERIOD_1} or SMA {SMA_PERIOD_2}")
+    
+    # FLAT REGIME OVERRIDE
+    if is_flat_regime:
+        log.info("FLAT REGIME ACTIVE: Forcing FLAT signal (no position)")
+        return "FLAT", sma_1, sma_2
     
     # Generate signal based on previous close vs both SMAs
     signal = "FLAT"
@@ -394,6 +455,8 @@ def smoke_test(api: kf.KrakenFuturesApi):
         leverage = determine_leverage(iii)
         log.info(f"III (35-day): {iii:.4f}")
         log.info(f"Determined leverage: {leverage}x")
+        log.info(f"Flat regime threshold: {FLAT_REGIME_THRESHOLD}")
+        log.info(f"Band width for release: {BAND_WIDTH_PCT:.1%}")
         
         log.info("=== Smoke-test complete ===")
         return True
@@ -411,7 +474,8 @@ def load_state() -> Dict:
         "performance": {},
         "current_position": None,
         "current_portfolio_value": 0,
-        "strategy_info": {}
+        "strategy_info": {},
+        "flat_regime_active": False  # NEW: Track flat regime state
     }
 
 
@@ -450,6 +514,8 @@ def update_state_with_current_position(api: kf.KrakenFuturesApi):
             "take_profit_pct": TAKE_PROFIT_PCT * 100,
             "iii_window": III_WINDOW,
             "leverage_tiers": f"{LEV_LOW}x / {LEV_MID}x / {LEV_HIGH}x",
+            "flat_regime_threshold": FLAT_REGIME_THRESHOLD,
+            "band_width_pct": BAND_WIDTH_PCT * 100,
             "order_type": "limit",
             "limit_offset_pct": LIMIT_OFFSET_PCT * 100,
             "last_updated": datetime.now(timezone.utc).isoformat()
@@ -465,7 +531,7 @@ def update_state_with_current_position(api: kf.KrakenFuturesApi):
 
 
 def daily_trade(api: kf.KrakenFuturesApi):
-    """Execute daily trading strategy"""
+    """Execute daily trading strategy with flat regime detection"""
     state = load_state()
     
     df = kraken_ohlc.get_ohlc(SYMBOL_OHLC_KRAKEN, INTERVAL_KRAKEN)
@@ -484,11 +550,23 @@ def daily_trade(api: kf.KrakenFuturesApi):
     log.info(f"Thresholds: Low={III_T_LOW}, High={III_T_HIGH}")
     log.info(f"Determined leverage: {leverage}x")
     
-    if leverage < 1.0:
-        log.info(f"Leverage is {leverage}x - choppy market, reduced position sizing")
+    # FLAT REGIME LOGIC
+    current_flat_regime = state.get("flat_regime_active", False)
+    log.info(f"=== FLAT REGIME CHECK ===")
+    log.info(f"Current flat regime status: {current_flat_regime}")
     
-    # Generate signal (no more cross flag)
-    signal, sma_1, sma_2 = generate_signal(df, current_price)
+    # Check trigger (enter flat regime)
+    is_flat_regime = check_flat_regime_trigger(iii, current_flat_regime)
+    
+    # Check release (exit flat regime)
+    if is_flat_regime:
+        is_flat_regime = check_flat_regime_release(df, is_flat_regime)
+    
+    log.info(f"Flat regime status after checks: {is_flat_regime}")
+    state["flat_regime_active"] = is_flat_regime
+    
+    # Generate signal (with flat regime override)
+    signal, sma_1, sma_2 = generate_signal(df, current_price, is_flat_regime)
     
     # Flatten
     log.info("=== STEP 1: Flatten with limit order ===")
@@ -507,7 +585,8 @@ def daily_trade(api: kf.KrakenFuturesApi):
     collateral = portfolio_usd(api)
     
     if signal == "FLAT":
-        log.info("Signal is FLAT - staying out of market (no position)")
+        reason = "flat regime active" if is_flat_regime else "signal logic"
+        log.info(f"Signal is FLAT - staying out of market ({reason})")
         
         trade_record = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -520,9 +599,10 @@ def daily_trade(api: kf.KrakenFuturesApi):
             "sma_2": sma_2,
             "iii": iii,
             "leverage": leverage,
+            "flat_regime_active": is_flat_regime,
             "stop_distance": 0,
             "tp_distance": 0,
-            "note": "Stayed flat due to signal logic"
+            "note": f"Stayed flat due to {reason}"
         }
         
         state["trades"].append(trade_record)
@@ -577,6 +657,7 @@ def daily_trade(api: kf.KrakenFuturesApi):
             "sma_2": sma_2,
             "iii": iii,
             "leverage": leverage,
+            "flat_regime_active": is_flat_regime,
             "stop_distance": stop_distance,
             "stop_loss_pct": STATIC_STOP_PCT * 100,
             "tp_distance": tp_distance,
@@ -601,8 +682,11 @@ def daily_trade(api: kf.KrakenFuturesApi):
         "take_profit_pct": TAKE_PROFIT_PCT * 100,
         "iii_window": III_WINDOW,
         "leverage_tiers": f"{LEV_LOW}x / {LEV_MID}x / {LEV_HIGH}x",
+        "flat_regime_threshold": FLAT_REGIME_THRESHOLD,
+        "band_width_pct": BAND_WIDTH_PCT * 100,
         "current_iii": iii,
         "current_leverage": leverage,
+        "flat_regime_active": is_flat_regime,
         "order_type": "limit",
         "limit_offset_pct": LIMIT_OFFSET_PCT * 100,
         "last_updated": datetime.now(timezone.utc).isoformat()
@@ -610,7 +694,7 @@ def daily_trade(api: kf.KrakenFuturesApi):
     
     save_state(state)
     log.info(f"Trade executed and logged. Portfolio: ${collateral:.2f}")
-    log.info(f"III: {iii:.4f}, Leverage: {leverage}x")
+    log.info(f"III: {iii:.4f}, Leverage: {leverage}x, Flat Regime: {is_flat_regime}")
 
 
 def wait_until_00_01_utc():
@@ -633,7 +717,7 @@ def main():
 
     api = kf.KrakenFuturesApi(api_key, api_sec)
     
-    log.info("Initializing Dual SMA strategy with III dynamic leverage...")
+    log.info("Initializing Dual SMA strategy with III dynamic leverage + Flat Regime...")
     
     if not smoke_test(api):
         log.error("Smoke test failed, exiting")
