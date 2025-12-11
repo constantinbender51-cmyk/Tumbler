@@ -668,5 +668,234 @@ def daily_trade(api: kf.KrakenFuturesApi):
     leverage = determine_leverage(iii)
     
     log.info(f"=== III CALCULATION ===")
-    log.info(f"III (35-day): {iii:.4f}")
-    log.info(f"Thresholds: Low={III_T_LOW}, High={III_T_HIGH
+    log.info(f"III (27-day): {iii:.4f}")
+    log.info(f"Thresholds: Low={III_T_LOW}, High={III_T_HIGH}")
+    log.info(f"Determined leverage: {leverage}x")
+    
+    # FLAT REGIME LOGIC
+    current_flat_regime = state.get("flat_regime_active", False)
+    log.info(f"=== FLAT REGIME CHECK ===")
+    log.info(f"Current flat regime status: {current_flat_regime}")
+    
+    # Check trigger (enter flat regime)
+    is_flat_regime = check_flat_regime_trigger(iii, current_flat_regime)
+    
+    # Check release (exit flat regime)
+    if is_flat_regime:
+        is_flat_regime = check_flat_regime_release(df, is_flat_regime)
+    
+    log.info(f"Flat regime status after checks: {is_flat_regime}")
+    state["flat_regime_active"] = is_flat_regime
+    
+    # Generate signal (with flat regime override) using CURRENT data
+    signal, sma_1, sma_2 = generate_signal(df, current_price, is_flat_regime)
+    
+    # Flatten
+    log.info("=== STEP 1: Flatten with limit order ===")
+    flatten_position_limit(api, current_price)
+    
+    log.info("=== STEP 2: Sleeping 600 seconds ===")
+    time.sleep(600)
+    
+    log.info("=== STEP 3: Flatten remaining with market order ===")
+    flatten_position_market(api)
+    
+    log.info("=== STEP 4: Cancel all orders ===")
+    cancel_all(api)
+    time.sleep(2)
+    
+    collateral = portfolio_usd(api)
+    
+    if signal == "FLAT":
+        reason = "flat regime active" if is_flat_regime else "signal logic"
+        log.info(f"Signal is FLAT - staying out of market ({reason})")
+        
+        trade_record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "signal": "FLAT",
+            "side": "none",
+            "size_btc": 0,
+            "fill_price": current_price,
+            "portfolio_value": collateral,
+            "sma_1": sma_1,
+            "sma_2": sma_2,
+            "iii": iii,
+            "leverage": leverage,
+            "flat_regime_active": is_flat_regime,
+            "stop_distance": 0,
+            "tp_distance": 0,
+            "note": f"Stayed flat due to {reason}"
+        }
+        
+        state["trades"].append(trade_record)
+        state["current_position"] = None
+        
+    else:
+        notional = collateral * leverage
+        size_btc = round(notional / current_price, 4)
+        side = "buy" if signal == "LONG" else "sell"
+        
+        log.info(f"Opening {signal} position with {leverage}x leverage: {size_btc} BTC")
+        
+        if dry:
+            log.info(f"DRY-RUN: {signal} {size_btc} BTC at ${current_price:.2f}")
+            fill_price = current_price
+            final_size = size_btc
+        else:
+            log.info("=== STEP 5: Place entry limit order ===")
+            limit_price = place_entry_limit(api, side, size_btc, current_price)
+            
+            log.info("=== STEP 6: Sleeping 600 seconds ===")
+            time.sleep(600)
+            
+            log.info("=== STEP 7: Place entry market for remaining ===")
+            current_price = mark_price(api)
+            final_size = place_entry_market_remaining(api, side, size_btc, current_price)
+            fill_price = current_price
+            
+            log.info("=== STEP 8: Cancel all orders ===")
+            cancel_all(api)
+            time.sleep(2)
+            
+            log.info(f"Final position: {final_size:.4f} BTC @ ${fill_price:.2f}")
+            
+            log.info("=== STEP 9: Place stop loss ===")
+            place_stop(api, side, final_size, fill_price)
+            
+            log.info("=== STEP 10: Place take profit ===")
+            place_take_profit(api, side, final_size, fill_price)
+        
+        stop_distance = fill_price * STATIC_STOP_PCT
+        tp_distance = fill_price * TAKE_PROFIT_PCT
+        
+        trade_record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "signal": signal,
+            "side": side,
+            "size_btc": final_size if not dry else size_btc,
+            "fill_price": fill_price,
+            "portfolio_value": collateral,
+            "sma_1": sma_1,
+            "sma_2": sma_2,
+            "iii": iii,
+            "leverage": leverage,
+            "flat_regime_active": is_flat_regime,
+            "stop_distance": stop_distance,
+            "stop_loss_pct": STATIC_STOP_PCT * 100,
+            "tp_distance": tp_distance,
+            "take_profit_pct": TAKE_PROFIT_PCT * 100,
+        }
+        
+        state["trades"].append(trade_record)
+    
+    if state["starting_capital"]:
+        total_return = (collateral - state["starting_capital"]) / state["starting_capital"] * 100
+        state["performance"] = {
+            "current_value": collateral,
+            "starting_capital": state["starting_capital"],
+            "total_return_pct": total_return,
+            "total_trades": len(state["trades"]),
+        }
+    
+    state["strategy_info"] = {
+        "sma_period_1": SMA_PERIOD_1,
+        "sma_period_2": SMA_PERIOD_2,
+        "stop_loss_pct": STATIC_STOP_PCT * 100,
+        "take_profit_pct": TAKE_PROFIT_PCT * 100,
+        "iii_window": III_WINDOW,
+        "leverage_tiers": f"{LEV_LOW}x / {LEV_MID}x / {LEV_HIGH}x",
+        "flat_regime_threshold": FLAT_REGIME_THRESHOLD,
+        "band_width_pct": BAND_WIDTH_PCT * 100,
+        "current_iii": iii,
+        "current_leverage": leverage,
+        "flat_regime_active": is_flat_regime,
+        "order_type": "limit",
+        "limit_offset_pct": LIMIT_OFFSET_PCT * 100,
+        "last_updated": datetime.now(timezone.utc).isoformat()
+    }
+    
+    save_state(state)
+    log.info(f"Trade executed and logged. Portfolio: ${collateral:.2f}")
+    log.info(f"III: {iii:.4f}, Leverage: {leverage}x, Flat Regime: {is_flat_regime}")
+
+
+def wait_until_00_01_utc():
+    """Wait until 00:01 UTC for daily execution"""
+    now = datetime.now(timezone.utc)
+    next_run = now.replace(hour=0, minute=1, second=0, microsecond=0)
+    if now >= next_run:
+        next_run += timedelta(days=1)
+    wait_sec = (next_run - now).total_seconds()
+    log.info("Next run at 00:01 UTC (%s), sleeping %.0f s", next_run.strftime("%Y-%m-%d"), wait_sec)
+    time.sleep(wait_sec)
+
+
+def main():
+    api_key = os.getenv("KRAKEN_API_KEY")
+    api_sec = os.getenv("KRAKEN_API_SECRET")
+    if not api_key or not api_sec:
+        log.error("Env vars KRAKEN_API_KEY / KRAKEN_API_SECRET missing")
+        sys.exit(1)
+
+    api = kf.KrakenFuturesApi(api_key, api_sec)
+    
+    log.info("Initializing Dual SMA strategy with III dynamic leverage + Flat Regime...")
+    log.info("USING GENETICALLY OPTIMIZED PARAMETERS")
+    log.info("Live trading uses CURRENT data (price, SMAs, III)")
+    
+    if not smoke_test(api):
+        log.error("Smoke test failed, exiting")
+        sys.exit(1)
+    
+    # Initialize flat regime state from historical data
+    is_flat_regime = initialize_flat_regime_state(api)
+    
+    # Update state file with flat regime status
+    state = load_state()
+    state["flat_regime_active"] = is_flat_regime
+    save_state(state)
+    
+    update_state_with_current_position(api)
+    
+    log.info("State file initialized with current portfolio data")
+    
+    if STATE_FILE.exists():
+        log.info(f"State file confirmed at: {STATE_FILE.absolute()}")
+    else:
+        log.error("State file was not created!")
+    
+    # If in flat regime, wait for release before proceeding
+    if is_flat_regime:
+        log.info("Starting in FLAT REGIME - waiting for release condition...")
+        wait_for_flat_regime_release(api)
+        
+        # Update state after release
+        state = load_state()
+        state["flat_regime_active"] = False
+        save_state(state)
+        log.info("Flat regime released - proceeding with normal operations")
+
+    if RUN_TRADE_NOW:
+        log.info("RUN_TRADE_NOW=true – executing trade now")
+        try:
+            daily_trade(api)
+        except Exception as exc:
+            log.exception("Immediate trade failed: %s", exc)
+
+    log.info("Starting web dashboard on port %s", os.getenv("PORT", 8080))
+    time.sleep(1)
+    subprocess.Popen([sys.executable, "web_state.py"])
+
+    while True:
+        wait_until_00_01_utc()
+        try:
+            daily_trade(api)
+        except KeyboardInterrupt:
+            log.info("Interrupted")
+            break
+        except Exception as exc:
+            log.exception("Daily trade failed: %s", exc)
+
+
+if __name__ == "__main__":
+    main()
