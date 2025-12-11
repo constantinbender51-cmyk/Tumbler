@@ -26,25 +26,25 @@ app = Flask(__name__)
 # Import the Kraken Futures API client
 import kraken_futures as kf
 
-# Configuration
+# Configuration - OPTIMIZED PARAMETERS FROM GENETIC ALGORITHM
 STATE_FILE = Path("web_state.json")
 BACKTEST_CHART_PATH = Path("/app/static/backtest.png")
 UPDATE_INTERVAL = 300  # 5 minutes
 SYMBOL_FUTS_UC = "PF_XBTUSD"
 SYMBOL_OHLC_KRAKEN = "XBTUSD"
 INTERVAL_KRAKEN = 1440
-SMA_PERIOD_1 = 40
-SMA_PERIOD_2 = 120
-STATIC_STOP_PCT = 2.0  # 2% static stop
-TAKE_PROFIT_PCT = 16.0  # 16% take profit
-III_WINDOW = 35
-III_T_LOW = 0.13
-III_T_HIGH = 0.18
-LEV_LOW = 0.5
-LEV_MID = 4.5
-LEV_HIGH = 2.45
-FLAT_REGIME_THRESHOLD = 0.16
-BAND_WIDTH_PCT = 0.045  # 4.5%
+SMA_PERIOD_1 = 32      # Optimized from 40
+SMA_PERIOD_2 = 114     # Optimized from 120
+STATIC_STOP_PCT = 4.3  # 4.3% static stop (optimized from 2%)
+TAKE_PROFIT_PCT = 12.6 # 12.6% take profit (optimized from 16%)
+III_WINDOW = 27        # Optimized from 35
+III_T_LOW = 0.058      # Optimized from 0.13
+III_T_HIGH = 0.259     # Optimized from 0.18
+LEV_LOW = 0.079        # Choppy - essentially flat
+LEV_MID = 4.327        # Sweet spot (0.058-0.259) - MAXIMUM CONVICTION
+LEV_HIGH = 3.868       # Overextended (>0.259) - reduce slightly
+FLAT_REGIME_THRESHOLD = 0.356  # Optimized from 0.16
+BAND_WIDTH_PCT = 0.077  # 7.7% optimized from 4.5%
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -177,45 +177,44 @@ class DashboardMonitor:
 
     def calculate_iii(self, df: pd.DataFrame, end_idx: int) -> float:
         """
-        Calculate Inefficiency Index (III) over the last 35 days
-        CRITICAL: Uses only data UP TO end_idx (inclusive)
-        For day i, this should be called with end_idx = i-1 to avoid lookahead
+        Calculate Inefficiency Index (III) - NOT USED IN BACKTEST
+        This is only for live dashboard display
+        Backtest uses the exact app.py method inline
         """
         if end_idx < III_WINDOW:
             return 0.0
         
-        # Get window ending at end_idx (i.e., using only past data)
+        # Get window ending at end_idx
         start_idx = max(0, end_idx - III_WINDOW)
         window_df = df.iloc[start_idx:end_idx + 1].copy()
         
         if len(window_df) < 2:
             return 0.0
         
-        # Calculate log returns
         window_df['log_ret'] = np.log(window_df['close'] / window_df['close'].shift(1))
         log_rets = window_df['log_ret'].dropna()
         
         if len(log_rets) < III_WINDOW:
             return 0.0
         
-        # Net direction = sum of log returns (total movement)
         net_direction = abs(log_rets.sum())
-        
-        # Path length = sum of absolute log returns (total distance traveled)
         path_length = log_rets.abs().sum()
-        
-        # III calculation
         epsilon = 1e-8
         iii = net_direction / (path_length + epsilon)
         
         return iii
     
     def determine_leverage(self, iii: float) -> float:
-        """Determine leverage based on III value"""
+        """
+        Determine leverage based on III value - OPTIMIZED STRUCTURE
+        - III < 0.058: 0.079x (choppy - stay out)
+        - 0.058 ≤ III < 0.259: 4.327x (sweet spot - MAXIMUM CONVICTION)
+        - III ≥ 0.259: 3.868x (overextended - reduce slightly)
+        """
         if iii < III_T_LOW:
             return LEV_LOW
         elif iii < III_T_HIGH:
-            return LEV_MID
+            return LEV_MID  # THE MONEY ZONE
         else:
             return LEV_HIGH
 
@@ -233,132 +232,153 @@ class DashboardMonitor:
     def run_backtest(self, df: pd.DataFrame, initial_capital: float = 1000.0) -> pd.DataFrame:
         """
         Run backtest on historical data (last 720 days)
-        CRITICAL: Uses ONLY prior day data for each day's signal
-        - Day i signal uses: close[i-1], sma[i-1], iii[i-1]
-        - Day i PnL uses: open[i], high[i], low[i], close[i]
-        NO LOOKAHEAD BIAS
+        EXACT COPY of app (7).py strategy logic - NO DOUBLE LAG
+        Uses ONLY prior day data for each day's signal - NO LOOKAHEAD BIAS
         """
         # Limit to 720 days
         df = df.tail(720).copy()
         df = df.reset_index(drop=False)
         
-        # Pre-calculate SMAs for ALL days
-        df['sma_1'] = df['close'].rolling(window=SMA_PERIOD_1).mean()
-        df['sma_2'] = df['close'].rolling(window=SMA_PERIOD_2).mean()
+        # 1. Log Returns (EXACT match to app.py)
+        df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
         
-        # Pre-calculate III for ALL days (using only prior data)
-        iii_values = []
-        for i in range(len(df)):
-            if i < III_WINDOW:
-                iii_values.append(0.0)
-            else:
-                # CRITICAL: Calculate III using data up to i-1 (prior day)
-                iii = self.calculate_iii(df, i - 1)
-                iii_values.append(iii)
-        df['iii'] = iii_values
+        # 2. SMAs (EXACT match to app.py) - OPTIMIZED
+        df['sma_32'] = df['close'].rolling(window=32).mean()
+        df['sma_114'] = df['close'].rolling(window=114).mean()
         
-        # Pre-calculate leverage for ALL days
-        df['leverage'] = df['iii'].apply(self.determine_leverage)
+        # 3. Calculate III (Efficiency Ratio) for window W=27 (EXACT match to app.py)
+        w = 27
+        df['iii'] = (df['log_ret'].rolling(w).sum().abs() / 
+                     df['log_ret'].abs().rolling(w).sum()).fillna(0)
         
-        # Initialize flat regime state
+        # SHIFT iii by 1: We decide today's trade using yesterday's efficiency (EXACT match to app.py)
+        df['iii_shifted'] = df['iii'].shift(1)
+        
+        # 4. Leverage Logic (EXACT match to app.py) - OPTIMIZED STRUCTURE
+        # < 0.058 -> 0.079, < 0.259 -> 4.327, else 3.868
+        # Uses the shifted iii
+        conditions = [
+            (df['iii_shifted'] < 0.058),
+            (df['iii_shifted'] < 0.259)
+        ]
+        choices = [0.079, 4.327]
+        df['leverage'] = np.select(conditions, choices, default=3.868)
+        
+        # Prepare Numpy Arrays for loop (EXACT match to app.py)
+        opens = df['open'].values
+        highs = df['high'].values
+        lows = df['low'].values
+        closes = df['close'].values
+        sma32s = df['sma_32'].values
+        sma114s = df['sma_114'].values
+        iii_shifted = df['iii_shifted'].values
+        leverages = df['leverage'].values
+        
+        n = len(closes)
+        signals = np.zeros(n)
+        returns = np.zeros(n)
+        flat_regime_flags = np.zeros(n, dtype=bool)
+        
+        # Strategy Loop State (EXACT match to app.py) - OPTIMIZED
         is_flat_regime = False
-        flat_regime_status = []
+        sl_pct = 0.043  # 4.3%
+        tp_pct = 0.126  # 12.6%
+        U = 0.356  # iii threshold for flat regime
+        Y = 0.077  # Bandwidth (7.7%)
         
-        # Generate signals using ONLY prior day data
-        signals = []
-        for i in range(len(df)):
-            # Need at least 1 prior day and valid SMAs
-            if i == 0 or pd.isna(df['sma_1'].iloc[i-1]) or pd.isna(df['sma_2'].iloc[i-1]):
-                signals.append('FLAT')
-                flat_regime_status.append(False)
-                continue
+        # Start at 114 to allow SMAs to populate (EXACT match to app.py)
+        for i in range(114, n):
+            # --- A. Flat Regime Logic --- (EXACT match to app.py)
             
-            # Get PRIOR DAY data for signal generation
-            prior_close = df['close'].iloc[i-1]
-            prior_sma_1 = df['sma_1'].iloc[i-1]
-            prior_sma_2 = df['sma_2'].iloc[i-1]
-            prior_iii = df['iii'].iloc[i-1]  # This already uses data up to i-2
-            
-            # FLAT REGIME CHECK (using prior day III)
-            # Trigger: Prior day III < 0.16
-            if prior_iii < FLAT_REGIME_THRESHOLD:
+            # 1. Trigger: If iii (yesterday) < U, enter flat regime
+            if iii_shifted[i] < U:
                 is_flat_regime = True
             
-            # Release: Check if prior day price entered bands
+            # 2. Release: If in flat regime, check if price enters band Y around SMAs
             if is_flat_regime:
-                diff_sma1 = abs(prior_close - prior_sma_1)
-                diff_sma2 = abs(prior_close - prior_sma_2)
-                thresh_sma1 = prior_sma_1 * BAND_WIDTH_PCT
-                thresh_sma2 = prior_sma_2 * BAND_WIDTH_PCT
+                # Check bands using YESTERDAY'S price vs SMAs (to avoid lookahead on release)
+                prev_c = closes[i-1]
+                prev_s32 = sma32s[i-1]
+                prev_s114 = sma114s[i-1]
                 
-                if diff_sma1 <= thresh_sma1 or diff_sma2 <= thresh_sma2:
+                diff1 = abs(prev_c - prev_s32)
+                diff2 = abs(prev_c - prev_s114)
+                thresh1 = prev_s32 * Y
+                thresh2 = prev_s114 * Y
+                
+                # If price is within Y% of EITHER SMA
+                if diff1 <= thresh1 or diff2 <= thresh2:
                     is_flat_regime = False
             
-            flat_regime_status.append(is_flat_regime)
+            flat_regime_flags[i] = is_flat_regime
             
-            # Generate signal
+            # --- B. Signal Generation --- (EXACT match to app.py)
+            
             if is_flat_regime:
-                signals.append('FLAT')
-            elif prior_close > prior_sma_1 and prior_close > prior_sma_2:
-                signals.append('LONG')
-            elif prior_close < prior_sma_1 and prior_close < prior_sma_2:
-                signals.append('SHORT')
+                signals[i] = 0
             else:
-                signals.append('FLAT')
-        
-        df['signal'] = signals
-        df['flat_regime'] = flat_regime_status
-        
-        # Backtest with SL/TP using CURRENT day OHLC
-        equity = initial_capital
-        equity_curve = []
-        
-        for i in range(len(df)):
-            if i == 0:
-                equity_curve.append(equity)
+                # Standard Trend Logic (Yesterday's close vs SMAs)
+                prev_c = closes[i-1]
+                prev_s32 = sma32s[i-1]
+                prev_s114 = sma114s[i-1]
+                
+                if prev_c > prev_s32 and prev_c > prev_s114:
+                    signals[i] = 1  # Long
+                elif prev_c < prev_s32 and prev_c < prev_s114:
+                    signals[i] = -1  # Short
+                else:
+                    signals[i] = 0
+            
+            # --- C. PnL Calculation --- (EXACT match to app.py)
+            
+            lev = leverages[i]
+            signal = signals[i]
+            
+            if signal == 0 or np.isnan(lev):
+                returns[i] = 0.0
                 continue
             
-            signal = df['signal'].iloc[i]
-            leverage = df['leverage'].iloc[i-1]  # Use PRIOR day leverage
+            o, h, l, c = opens[i], highs[i], lows[i], closes[i]
+            daily_ret = 0.0
             
-            # Use CURRENT day OHLC for execution
-            open_price = df['open'].iloc[i]
-            high_price = df['high'].iloc[i]
-            low_price = df['low'].iloc[i]
-            close_price = df['close'].iloc[i]
-            
-            daily_return = 0.0
-            
-            if signal == 'LONG':
-                entry = open_price
-                sl = entry * (1 - STATIC_STOP_PCT / 100)
-                tp = entry * (1 + TAKE_PROFIT_PCT / 100)
-                
-                if low_price <= sl:
-                    daily_return = -(STATIC_STOP_PCT / 100)
-                elif high_price >= tp:
-                    daily_return = (TAKE_PROFIT_PCT / 100)
+            if signal == 1:
+                stop = o * (1 - sl_pct)
+                take = o * (1 + tp_pct)
+                if l <= stop:
+                    daily_ret = -sl_pct
+                elif h >= take:
+                    daily_ret = tp_pct
                 else:
-                    daily_return = (close_price - entry) / entry
-                    
-            elif signal == 'SHORT':
-                entry = open_price
-                sl = entry * (1 + STATIC_STOP_PCT / 100)
-                tp = entry * (1 - TAKE_PROFIT_PCT / 100)
-                
-                if high_price >= sl:
-                    daily_return = -(STATIC_STOP_PCT / 100)
-                elif low_price <= tp:
-                    daily_return = (TAKE_PROFIT_PCT / 100)
+                    daily_ret = (c - o) / o
+            else:  # Short
+                stop = o * (1 + sl_pct)
+                take = o * (1 - tp_pct)
+                if h >= stop:
+                    daily_ret = -sl_pct
+                elif l <= take:
+                    daily_ret = tp_pct
                 else:
-                    daily_return = (entry - close_price) / entry
+                    daily_ret = (o - c) / o
             
-            # Apply leverage
-            leveraged_return = daily_return * leverage
-            equity *= (1 + leveraged_return)
-            equity_curve.append(equity)
+            returns[i] = daily_ret * lev
         
+        # Store results (EXACT match to app.py)
+        df['strategy_ret'] = returns
+        df['signal'] = signals
+        df['flat_regime'] = flat_regime_flags
+        
+        # Convert signals to text
+        signal_map = {0: 'FLAT', 1: 'LONG', -1: 'SHORT'}
+        df['signal_text'] = df['signal'].map(signal_map)
+        
+        # Calculate cumulative equity (EXACT match to app.py)
+        equity = initial_capital
+        equity_curve = []
+        for ret in returns:
+            equity *= (1 + ret)
+            equity_curve.append(equity)
         df['equity'] = equity_curve
+        
         df.set_index('time', inplace=True)
         return df
     
@@ -388,12 +408,12 @@ class DashboardMonitor:
             
             # Color background by signal
             for i in range(1, len(backtest_df)):
-                signal = backtest_df['signal'].iloc[i]
+                signal = backtest_df['signal_text'].iloc[i]
                 color = 'lightgreen' if signal == 'LONG' else 'lightcoral' if signal == 'SHORT' else 'lightgray'
                 ax1.axvspan(backtest_df.index[i-1], backtest_df.index[i], alpha=0.3, color=color)
             
             ax1.set_ylabel('Portfolio Value ($)', fontsize=11)
-            ax1.set_title(f'720-Day Backtest: SMA({SMA_PERIOD_1}/{SMA_PERIOD_2}) + III + Flat Regime', 
+            ax1.set_title(f'720-Day Backtest: SMA({SMA_PERIOD_1}/{SMA_PERIOD_2}) + III + Flat Regime (OPTIMIZED)', 
                          fontsize=13, fontweight='bold')
             ax1.grid(True, alpha=0.3)
             ax1.legend(loc='upper left')
