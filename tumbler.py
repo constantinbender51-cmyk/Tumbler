@@ -7,6 +7,8 @@ III-Based Leverage: 0.5x (choppy) / 4.5x (trending) / 2.45x (overextended)
 Flat Regime: Pauses trading when III < 0.16, resumes when price enters 4.5% bands
 Trades daily at 00:01 UTC with 2% SL + 16% TP
 Uses CURRENT data for all live trading decisions
+Initializes flat regime state on startup from historical data
+FIXED: III calculation now matches app.py exactly (no window slicing)
 """
 
 import json
@@ -35,25 +37,25 @@ SYMBOL_OHLC_BINANCE = "BTCUSDT"
 INTERVAL_KRAKEN = 1440
 INTERVAL_BINANCE = "1d"
 
-# Strategy Parameters
-SMA_PERIOD_1 = 40   # Primary logic SMA
-SMA_PERIOD_2 = 120  # Filter SMA
-STATIC_STOP_PCT = 0.02  # 2% static stop loss
-TAKE_PROFIT_PCT = 0.16  # 16% take profit
+# Strategy Parameters - OPTIMIZED FROM GENETIC ALGORITHM
+SMA_PERIOD_1 = 32   # Primary logic SMA (optimized from 40)
+SMA_PERIOD_2 = 114  # Filter SMA (optimized from 120)
+STATIC_STOP_PCT = 0.043  # 4.3% static stop loss (optimized from 2%)
+TAKE_PROFIT_PCT = 0.126  # 12.6% take profit (optimized from 16%)
 LIMIT_OFFSET_PCT = 0.0002  # 0.02% offset for limit orders
 STOP_WAIT_TIME = 600  # Wait 10 minutes
 
-# III Parameters
-III_WINDOW = 35  # 35-day window for III calculation
-III_T_LOW = 0.13  # Below this: 0.5x leverage (choppy)
-III_T_HIGH = 0.18  # Above this: 2.45x leverage (overextended)
-LEV_LOW = 0.5   # Choppy market
-LEV_MID = 4.5   # Trending market
-LEV_HIGH = 2.45  # Overextended market
+# III Parameters - OPTIMIZED
+III_WINDOW = 27  # 27-day window for III calculation (optimized from 35)
+III_T_LOW = 0.058  # Below this: 0.079x leverage (choppy)
+III_T_HIGH = 0.259  # Above this: 3.868x leverage (overextended)
+LEV_LOW = 0.079   # Choppy market - essentially flat
+LEV_MID = 4.327   # Sweet spot trending (0.058-0.259) - MAXIMUM CONVICTION
+LEV_HIGH = 3.868  # Overextended market (>0.259) - reduce slightly
 
-# Flat Regime Parameters
-FLAT_REGIME_THRESHOLD = 0.16  # III below this triggers flat regime
-BAND_WIDTH_PCT = 0.045  # 4.5% bandwidth for regime release
+# Flat Regime Parameters - OPTIMIZED
+FLAT_REGIME_THRESHOLD = 0.356  # III below this triggers flat regime (optimized from 0.16)
+BAND_WIDTH_PCT = 0.077  # 7.7% bandwidth for regime release (optimized from 4.5%)
 
 STATE_FILE = Path("sma_state.json")
 
@@ -67,7 +69,7 @@ log = logging.getLogger("dual_sma_strategy")
 def calculate_iii(df: pd.DataFrame) -> float:
     """
     Calculate Inefficiency Index (III) over the last 35 days
-    Uses ALL available data up to current moment (no shifting for live trading)
+    Uses EXACT same method as app.py - rolling operations on full dataframe
     III = net_direction / path_length
     Higher III = more efficient/trending
     Lower III = more choppy/inefficient
@@ -75,44 +77,34 @@ def calculate_iii(df: pd.DataFrame) -> float:
     if len(df) < III_WINDOW + 1:
         return 0.0
     
-    # Get last 35 days + 1 for calculating returns
-    recent_df = df.tail(III_WINDOW + 1).copy()
+    # Create a copy to avoid modifying original
+    df_calc = df.copy()
     
     # Calculate log returns
-    recent_df['log_ret'] = np.log(recent_df['close'] / recent_df['close'].shift(1))
+    df_calc['log_ret'] = np.log(df_calc['close'] / df_calc['close'].shift(1))
     
-    # Remove NaN from first row
-    log_rets = recent_df['log_ret'].dropna()
+    # Calculate III using rolling operations (EXACT match to app.py)
+    w = III_WINDOW
+    iii_series = (df_calc['log_ret'].rolling(w).sum().abs() / 
+                  df_calc['log_ret'].abs().rolling(w).sum()).fillna(0)
     
-    if len(log_rets) < III_WINDOW:
-        return 0.0
-    
-    # Net direction = sum of log returns (total movement)
-    net_direction = abs(log_rets.sum())
-    
-    # Path length = sum of absolute log returns (total distance traveled)
-    path_length = log_rets.abs().sum()
-    
-    # III calculation
-    epsilon = 1e-8
-    iii = net_direction / (path_length + epsilon)
-    
-    return iii
+    # Return the most recent III value
+    return float(iii_series.iloc[-1])
 
 
 def determine_leverage(iii: float) -> float:
     """
-    Determine leverage based on III value
-    - III < 0.13: 0.5x (choppy)
-    - 0.13 <= III < 0.18: 4.5x (trending nicely)
-    - III >= 0.18: 2.45x (overextended, reduce risk)
+    Determine leverage based on III value - OPTIMIZED STRUCTURE
+    - III < 0.058: 0.079x (choppy - stay out)
+    - 0.058 ≤ III < 0.259: 4.327x (sweet spot - MAXIMUM CONVICTION)
+    - III ≥ 0.259: 3.868x (overextended - reduce slightly)
     """
     if iii < III_T_LOW:
-        return LEV_LOW  # 0.5x
+        return LEV_LOW  # 0.079x
     elif iii < III_T_HIGH:
-        return LEV_MID  # 4.5x
+        return LEV_MID  # 4.327x - THE MONEY ZONE
     else:
-        return LEV_HIGH  # 2.45x
+        return LEV_HIGH  # 3.868x
 
 
 def calculate_smas(df: pd.DataFrame) -> pd.DataFrame:
@@ -427,6 +419,137 @@ def place_take_profit(api: kf.KrakenFuturesApi, side: str, size_btc: float, fill
         log.error(f"Take profit order failed: {e}")
 
 
+def initialize_flat_regime_state(api: kf.KrakenFuturesApi) -> bool:
+    """
+    Initialize flat regime state based on historical data
+    Uses EXACT same III calculation as app.py
+    Returns True if currently in flat regime, False otherwise
+    """
+    try:
+        df = kraken_ohlc.get_ohlc(SYMBOL_OHLC_KRAKEN, INTERVAL_KRAKEN)
+        
+        # Calculate III using rolling operations (matching app.py)
+        df = df.copy()
+        df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
+        w = III_WINDOW
+        df['iii'] = (df['log_ret'].rolling(w).sum().abs() / 
+                     df['log_ret'].abs().rolling(w).sum()).fillna(0)
+        
+        # Get current III (most recent value)
+        current_iii = df['iii'].iloc[-1]
+        
+        log.info(f"=== INITIALIZING FLAT REGIME STATE ===")
+        log.info(f"Current III: {current_iii:.4f}")
+        log.info(f"Flat regime threshold: {FLAT_REGIME_THRESHOLD}")
+        
+        # Check if we should be in flat regime
+        if current_iii < FLAT_REGIME_THRESHOLD:
+            log.info(f"III {current_iii:.4f} < {FLAT_REGIME_THRESHOLD} - Checking historical band breaches...")
+            
+            # Find when III last dropped below threshold
+            below_threshold = df['iii'] < FLAT_REGIME_THRESHOLD
+            last_trigger_idx = None
+            
+            # Search backwards to find the most recent trigger
+            for i in range(len(df) - 1, -1, -1):
+                if below_threshold.iloc[i] and (i == 0 or df['iii'].iloc[i-1] >= FLAT_REGIME_THRESHOLD):
+                    last_trigger_idx = i
+                    break
+            
+            if last_trigger_idx is None:
+                log.info("Could not find trigger point - assuming FLAT REGIME")
+                return True
+            
+            log.info(f"Last flat regime trigger at index {last_trigger_idx} ({df.index[last_trigger_idx]})")
+            
+            # Check if bands were breached since trigger
+            df_calc = calculate_smas(df)
+            
+            for i in range(last_trigger_idx, len(df)):
+                close = df_calc['close'].iloc[i]
+                sma_1 = df_calc['sma_1'].iloc[i]
+                sma_2 = df_calc['sma_2'].iloc[i]
+                
+                if pd.isna(sma_1) or pd.isna(sma_2):
+                    continue
+                
+                diff_sma1 = abs(close - sma_1)
+                diff_sma2 = abs(close - sma_2)
+                thresh_sma1 = sma_1 * BAND_WIDTH_PCT
+                thresh_sma2 = sma_2 * BAND_WIDTH_PCT
+                
+                if diff_sma1 <= thresh_sma1 or diff_sma2 <= thresh_sma2:
+                    log.info(f"Band breach found at index {i} ({df.index[i]}) - RELEASED")
+                    return False
+            
+            log.info("No band breach found since trigger - FLAT REGIME ACTIVE")
+            return True
+        else:
+            log.info(f"III {current_iii:.4f} >= {FLAT_REGIME_THRESHOLD} - Normal trading active")
+            return False
+            
+    except Exception as e:
+        log.error(f"Error initializing flat regime state: {e}")
+        import traceback
+        log.error(traceback.format_exc())
+        return False
+
+
+def wait_for_flat_regime_release(api: kf.KrakenFuturesApi):
+    """
+    Wait until flat regime release condition is met
+    Checks every hour until price enters bands around SMAs
+    III recovery does NOT release - only band breach releases
+    """
+    log.info("=== WAITING FOR FLAT REGIME RELEASE ===")
+    log.info("Checking every hour until price enters 4.5% bands around SMAs")
+    log.info("NOTE: III recovery does NOT release flat regime - only band breach")
+    
+    while True:
+        try:
+            df = kraken_ohlc.get_ohlc(SYMBOL_OHLC_KRAKEN, INTERVAL_KRAKEN)
+            
+            # Calculate current III for logging only
+            df_calc_iii = df.copy()
+            df_calc_iii['log_ret'] = np.log(df_calc_iii['close'] / df_calc_iii['close'].shift(1))
+            w = III_WINDOW
+            df_calc_iii['iii'] = (df_calc_iii['log_ret'].rolling(w).sum().abs() / 
+                                  df_calc_iii['log_ret'].abs().rolling(w).sum()).fillna(0)
+            iii = df_calc_iii['iii'].iloc[-1]
+            
+            # Check if price entered bands
+            df_calc = calculate_smas(df)
+            current_close = df_calc['close'].iloc[-1]
+            current_sma_1 = df_calc['sma_1'].iloc[-1]
+            current_sma_2 = df_calc['sma_2'].iloc[-1]
+            current_price = mark_price(api)
+            
+            diff_sma1 = abs(current_close - current_sma_1)
+            diff_sma2 = abs(current_close - current_sma_2)
+            thresh_sma1 = current_sma_1 * BAND_WIDTH_PCT
+            thresh_sma2 = current_sma_2 * BAND_WIDTH_PCT
+            
+            in_band_1 = diff_sma1 <= thresh_sma1
+            in_band_2 = diff_sma2 <= thresh_sma2
+            
+            if in_band_1 or in_band_2:
+                log.info(f"Price ${current_close:.2f} entered bands!")
+                log.info("FLAT REGIME RELEASED - resuming normal trading")
+                return
+            
+            # Still waiting
+            log.info(f"Still in flat regime - III: {iii:.4f} (for info only), Price: ${current_price:.2f}")
+            log.info(f"  SMA1: ${current_sma_1:.2f}, diff: ${diff_sma1:.2f}, need: ${thresh_sma1:.2f}")
+            log.info(f"  SMA2: ${current_sma_2:.2f}, diff: ${diff_sma2:.2f}, need: ${thresh_sma2:.2f}")
+            log.info("Next check in 1 hour...")
+            
+            time.sleep(3600)  # Wait 1 hour
+            
+        except Exception as e:
+            log.error(f"Error checking flat regime release: {e}")
+            time.sleep(3600)  # Wait 1 hour and retry
+
+
 def smoke_test(api: kf.KrakenFuturesApi):
     """Run smoke test to verify API connectivity"""
     log.info("=== Smoke-test start ===")
@@ -546,213 +669,4 @@ def daily_trade(api: kf.KrakenFuturesApi):
     
     log.info(f"=== III CALCULATION ===")
     log.info(f"III (35-day): {iii:.4f}")
-    log.info(f"Thresholds: Low={III_T_LOW}, High={III_T_HIGH}")
-    log.info(f"Determined leverage: {leverage}x")
-    
-    # FLAT REGIME LOGIC
-    current_flat_regime = state.get("flat_regime_active", False)
-    log.info(f"=== FLAT REGIME CHECK ===")
-    log.info(f"Current flat regime status: {current_flat_regime}")
-    
-    # Check trigger (enter flat regime)
-    is_flat_regime = check_flat_regime_trigger(iii, current_flat_regime)
-    
-    # Check release (exit flat regime)
-    if is_flat_regime:
-        is_flat_regime = check_flat_regime_release(df, is_flat_regime)
-    
-    log.info(f"Flat regime status after checks: {is_flat_regime}")
-    state["flat_regime_active"] = is_flat_regime
-    
-    # Generate signal (with flat regime override) using CURRENT data
-    signal, sma_1, sma_2 = generate_signal(df, current_price, is_flat_regime)
-    
-    # Flatten
-    log.info("=== STEP 1: Flatten with limit order ===")
-    flatten_position_limit(api, current_price)
-    
-    log.info("=== STEP 2: Sleeping 600 seconds ===")
-    time.sleep(600)
-    
-    log.info("=== STEP 3: Flatten remaining with market order ===")
-    flatten_position_market(api)
-    
-    log.info("=== STEP 4: Cancel all orders ===")
-    cancel_all(api)
-    time.sleep(2)
-    
-    collateral = portfolio_usd(api)
-    
-    if signal == "FLAT":
-        reason = "flat regime active" if is_flat_regime else "signal logic"
-        log.info(f"Signal is FLAT - staying out of market ({reason})")
-        
-        trade_record = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "signal": "FLAT",
-            "side": "none",
-            "size_btc": 0,
-            "fill_price": current_price,
-            "portfolio_value": collateral,
-            "sma_1": sma_1,
-            "sma_2": sma_2,
-            "iii": iii,
-            "leverage": leverage,
-            "flat_regime_active": is_flat_regime,
-            "stop_distance": 0,
-            "tp_distance": 0,
-            "note": f"Stayed flat due to {reason}"
-        }
-        
-        state["trades"].append(trade_record)
-        state["current_position"] = None
-        
-    else:
-        notional = collateral * leverage
-        size_btc = round(notional / current_price, 4)
-        side = "buy" if signal == "LONG" else "sell"
-        
-        log.info(f"Opening {signal} position with {leverage}x leverage: {size_btc} BTC")
-        
-        if dry:
-            log.info(f"DRY-RUN: {signal} {size_btc} BTC at ${current_price:.2f}")
-            fill_price = current_price
-            final_size = size_btc
-        else:
-            log.info("=== STEP 5: Place entry limit order ===")
-            limit_price = place_entry_limit(api, side, size_btc, current_price)
-            
-            log.info("=== STEP 6: Sleeping 600 seconds ===")
-            time.sleep(600)
-            
-            log.info("=== STEP 7: Place entry market for remaining ===")
-            current_price = mark_price(api)
-            final_size = place_entry_market_remaining(api, side, size_btc, current_price)
-            fill_price = current_price
-            
-            log.info("=== STEP 8: Cancel all orders ===")
-            cancel_all(api)
-            time.sleep(2)
-            
-            log.info(f"Final position: {final_size:.4f} BTC @ ${fill_price:.2f}")
-            
-            log.info("=== STEP 9: Place stop loss ===")
-            place_stop(api, side, final_size, fill_price)
-            
-            log.info("=== STEP 10: Place take profit ===")
-            place_take_profit(api, side, final_size, fill_price)
-        
-        stop_distance = fill_price * STATIC_STOP_PCT
-        tp_distance = fill_price * TAKE_PROFIT_PCT
-        
-        trade_record = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "signal": signal,
-            "side": side,
-            "size_btc": final_size if not dry else size_btc,
-            "fill_price": fill_price,
-            "portfolio_value": collateral,
-            "sma_1": sma_1,
-            "sma_2": sma_2,
-            "iii": iii,
-            "leverage": leverage,
-            "flat_regime_active": is_flat_regime,
-            "stop_distance": stop_distance,
-            "stop_loss_pct": STATIC_STOP_PCT * 100,
-            "tp_distance": tp_distance,
-            "take_profit_pct": TAKE_PROFIT_PCT * 100,
-        }
-        
-        state["trades"].append(trade_record)
-    
-    if state["starting_capital"]:
-        total_return = (collateral - state["starting_capital"]) / state["starting_capital"] * 100
-        state["performance"] = {
-            "current_value": collateral,
-            "starting_capital": state["starting_capital"],
-            "total_return_pct": total_return,
-            "total_trades": len(state["trades"]),
-        }
-    
-    state["strategy_info"] = {
-        "sma_period_1": SMA_PERIOD_1,
-        "sma_period_2": SMA_PERIOD_2,
-        "stop_loss_pct": STATIC_STOP_PCT * 100,
-        "take_profit_pct": TAKE_PROFIT_PCT * 100,
-        "iii_window": III_WINDOW,
-        "leverage_tiers": f"{LEV_LOW}x / {LEV_MID}x / {LEV_HIGH}x",
-        "flat_regime_threshold": FLAT_REGIME_THRESHOLD,
-        "band_width_pct": BAND_WIDTH_PCT * 100,
-        "current_iii": iii,
-        "current_leverage": leverage,
-        "flat_regime_active": is_flat_regime,
-        "order_type": "limit",
-        "limit_offset_pct": LIMIT_OFFSET_PCT * 100,
-        "last_updated": datetime.now(timezone.utc).isoformat()
-    }
-    
-    save_state(state)
-    log.info(f"Trade executed and logged. Portfolio: ${collateral:.2f}")
-    log.info(f"III: {iii:.4f}, Leverage: {leverage}x, Flat Regime: {is_flat_regime}")
-
-
-def wait_until_00_01_utc():
-    """Wait until 00:01 UTC for daily execution"""
-    now = datetime.now(timezone.utc)
-    next_run = now.replace(hour=0, minute=1, second=0, microsecond=0)
-    if now >= next_run:
-        next_run += timedelta(days=1)
-    wait_sec = (next_run - now).total_seconds()
-    log.info("Next run at 00:01 UTC (%s), sleeping %.0f s", next_run.strftime("%Y-%m-%d"), wait_sec)
-    time.sleep(wait_sec)
-
-
-def main():
-    api_key = os.getenv("KRAKEN_API_KEY")
-    api_sec = os.getenv("KRAKEN_API_SECRET")
-    if not api_key or not api_sec:
-        log.error("Env vars KRAKEN_API_KEY / KRAKEN_API_SECRET missing")
-        sys.exit(1)
-
-    api = kf.KrakenFuturesApi(api_key, api_sec)
-    
-    log.info("Initializing Dual SMA strategy with III dynamic leverage + Flat Regime...")
-    log.info("Live trading uses CURRENT data (price, SMAs, III)")
-    
-    if not smoke_test(api):
-        log.error("Smoke test failed, exiting")
-        sys.exit(1)
-    
-    update_state_with_current_position(api)
-    
-    log.info("State file initialized with current portfolio data")
-    
-    if STATE_FILE.exists():
-        log.info(f"State file confirmed at: {STATE_FILE.absolute()}")
-    else:
-        log.error("State file was not created!")
-
-    if RUN_TRADE_NOW:
-        log.info("RUN_TRADE_NOW=true – executing trade now")
-        try:
-            daily_trade(api)
-        except Exception as exc:
-            log.exception("Immediate trade failed: %s", exc)
-
-    log.info("Starting web dashboard on port %s", os.getenv("PORT", 8080))
-    time.sleep(1)
-    subprocess.Popen([sys.executable, "web_state.py"])
-
-    while True:
-        wait_until_00_01_utc()
-        try:
-            daily_trade(api)
-        except KeyboardInterrupt:
-            log.info("Interrupted")
-            break
-        except Exception as exc:
-            log.exception("Daily trade failed: %s", exc)
-
-
-if __name__ == "__main__":
-    main()
+    log.info(f"Thresholds: Low={III_T_LOW}, High={III_T_HIGH
